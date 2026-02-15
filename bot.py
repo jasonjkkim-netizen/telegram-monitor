@@ -1,9 +1,10 @@
-"""
-Telegram Channel Monitor - Reads all your public channels and forwards
-unique (non-duplicate) messages to your own channel in real-time.
+“””
+Telegram Channel & Group Monitor
+Monitors ALL your public channels AND private groups.
+Forwards unique (non-duplicate) messages to your own channel.
 
 Setup instructions: See SETUP_GUIDE.md
-"""
+“””
 
 import os
 import asyncio
@@ -12,175 +13,212 @@ import time
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel
+from telethon.tl.types import Channel, Chat
 
 # ============================================================
-# CONFIGURATION - Set these as environment variables
-# ============================================================
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")  # Login session as text string
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "")  # Your channel username like @mychannel
-SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.75"))
+
+# CONFIGURATION - Set these as environment variables in Railway
 
 # ============================================================
+
+API_ID = int(os.environ.get(“API_ID”, 0))
+API_HASH = os.environ.get(“API_HASH”, “”)
+SESSION_STRING = os.environ.get(“SESSION_STRING”, “”)
+TARGET_CHANNEL = os.environ.get(“TARGET_CHANNEL”, “”)  # e.g. @my_filtered_news
+SIMILARITY_THRESHOLD = float(os.environ.get(“SIMILARITY_THRESHOLD”, “0.75”))
+
+# How many recent messages to remember for duplicate checking
+
+MAX_HISTORY = 500
+
+# ============================================================
+
 # DUPLICATE DETECTION
-# ============================================================
-class DuplicateDetector:
-    """Keeps track of recent messages and checks for duplicates."""
-
-    def __init__(self, max_history=2000, similarity_threshold=0.75):
-        self.history = []  # List of (text_hash, text_snippet, timestamp)
-        self.max_history = max_history
-        self.similarity_threshold = similarity_threshold
-
-    def _clean_text(self, text):
-        """Normalize text for comparison."""
-        if not text:
-            return ""
-        # Remove extra whitespace, convert to lowercase
-        text = " ".join(text.lower().split())
-        # Remove common prefixes like forwarded tags
-        for prefix in ["forwarded from", "via @", "🔔", "⚡", "🚨", "📢", "📣"]:
-            text = text.replace(prefix, "")
-        return text.strip()
-
-    def _get_hash(self, text):
-        """Create a hash of the cleaned text."""
-        return hashlib.md5(text.encode("utf-8")).hexdigest()
-
-    def is_duplicate(self, text):
-        """
-        Check if a message is a duplicate of a recent message.
-        Returns True if duplicate, False if unique.
-        """
-        if not text or len(text.strip()) < 20:
-            # Very short messages are hard to deduplicate meaningfully
-            return False
-
-        cleaned = self._clean_text(text)
-        text_hash = self._get_hash(cleaned)
-
-        # First check: exact match (fast)
-        for stored_hash, stored_text, _ in self.history:
-            if stored_hash == text_hash:
-                print(f"  ⚡ Exact duplicate detected")
-                return True
-
-        # Second check: similarity match (slower but catches paraphrased content)
-        for stored_hash, stored_text, _ in self.history:
-            # Only compare texts of similar length (optimization)
-            if abs(len(stored_text) - len(cleaned)) / max(len(stored_text), len(cleaned), 1) > 0.5:
-                continue
-
-            similarity = SequenceMatcher(None, cleaned[:500], stored_text[:500]).ratio()
-            if similarity >= self.similarity_threshold:
-                print(f"  🔍 Similar duplicate detected ({similarity:.0%} match)")
-                return True
-
-        # Not a duplicate - add to history
-        self.history.append((text_hash, cleaned, time.time()))
-
-        # Clean up old entries (keep only recent ones)
-        if len(self.history) > self.max_history:
-            self.history = self.history[-self.max_history:]
-
-        return False
-
 
 # ============================================================
+
+message_history = []  # List of recent message hashes/texts
+
+def normalize_text(text):
+“”“Clean up text for comparison”””
+if not text:
+return “”
+# Remove extra whitespace, lowercase
+return “ “.join(text.lower().split())
+
+def is_duplicate(new_text):
+“”“Check if a message is too similar to recent messages”””
+if not new_text or len(new_text.strip()) < 10:
+return False  # Skip very short messages
+
+```
+normalized = normalize_text(new_text)
+
+# Check exact hash match first (fastest)
+text_hash = hashlib.md5(normalized.encode()).hexdigest()
+for entry in message_history:
+    if entry["hash"] == text_hash:
+        return True
+
+# Check fuzzy similarity
+for entry in message_history:
+    similarity = SequenceMatcher(None, normalized, entry["text"]).ratio()
+    if similarity >= SIMILARITY_THRESHOLD:
+        return True
+
+# Not a duplicate — add to history
+message_history.append({
+    "hash": text_hash,
+    "text": normalized,
+    "time": time.time()
+})
+
+# Keep history from growing too large
+if len(message_history) > MAX_HISTORY:
+    message_history.pop(0)
+
+return False
+```
+
+# ============================================================
+
 # MAIN BOT
+
 # ============================================================
+
 async def main():
-    print("=" * 60)
-    print("  Telegram Channel Monitor - Starting Up")
-    print("=" * 60)
+# Validate configuration
+if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
+print(”\n❌ ERROR: Missing configuration!”)
+print(“Please set these environment variables in Railway:”)
+print(”  - API_ID”)
+print(”  - API_HASH”)
+print(”  - SESSION_STRING”)
+print(”  - TARGET_CHANNEL”)
+return
 
-    # Validate configuration
-    if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
-        print("\n❌ ERROR: Missing configuration!")
-        print("Please set these environment variables:")
-        print("  - API_ID")
-        print("  - API_HASH")
-        print("  - SESSION_STRING")
-        print("  - TARGET_CHANNEL")
-        return
+```
+# Connect using your session string
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+await client.start()
+me = await client.get_me()
+print(f"✅ Connected as: {me.first_name} ({me.phone})")
 
-    # Connect using your session string (no file needed!)
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    await client.start()
-    me = await client.get_me()
-    print(f"✅ Connected as: {me.first_name} ({me.phone})")
+# --------------------------------------------------------
+# Find all channels and groups to monitor
+# --------------------------------------------------------
+print("\n📡 Finding your channels and groups...")
 
-    # Get all channels you follow (automatic!)
-    print("\n📡 Finding your channels...")
-    channels = []
-    async for dialog in client.iter_dialogs():
-        if isinstance(dialog.entity, Channel) and dialog.entity.broadcast:
-            channels.append(dialog.entity)
-            print(f"  📺 {dialog.name}")
+monitored_ids = set()
+channel_count = 0
+group_count = 0
 
-    print(f"\n📊 Monitoring {len(channels)} channels")
-    print(f"📤 Forwarding unique posts to: {TARGET_CHANNEL}")
-    print(f"🔍 Duplicate threshold: {SIMILARITY_THRESHOLD:.0%}")
-    print("\n" + "=" * 60)
-    print("  Listening for new messages... (Press Ctrl+C to stop)")
-    print("=" * 60 + "\n")
+# Get the target channel ID so we don't monitor our own output
+try:
+    target_entity = await client.get_entity(TARGET_CHANNEL)
+    target_id = target_entity.id
+except Exception:
+    target_id = None
 
-    # Initialize duplicate detector
-    detector = DuplicateDetector(similarity_threshold=SIMILARITY_THRESHOLD)
+async for dialog in client.iter_dialogs():
+    entity = dialog.entity
 
-    # Get channel IDs for event filtering
-    channel_ids = [ch.id for ch in channels]
+    # Public channels (broadcast channels you follow)
+    if isinstance(entity, Channel) and entity.broadcast:
+        if entity.id != target_id:
+            monitored_ids.add(entity.id)
+            print(f"  📺 Channel: {dialog.name}")
+            channel_count += 1
 
-    @client.on(events.NewMessage(chats=channel_ids))
-    async def handler(event):
-        """Handle new messages from monitored channels."""
+    # Groups (megagroups / supergroups / private groups)
+    elif isinstance(entity, Channel) and entity.megagroup:
+        if entity.id != target_id:
+            monitored_ids.add(entity.id)
+            print(f"  👥 Group: {dialog.name}")
+            group_count += 1
+
+    # Old-style small groups
+    elif isinstance(entity, Chat):
+        monitored_ids.add(entity.id)
+        print(f"  👥 Group: {dialog.name}")
+        group_count += 1
+
+print(f"\n📊 Monitoring {channel_count} channels + {group_count} groups = {channel_count + group_count} total")
+
+# --------------------------------------------------------
+# Listen for new messages
+# --------------------------------------------------------
+@client.on(events.NewMessage())
+async def handler(event):
+    try:
+        # Only process messages from monitored chats
+        chat_id = event.chat_id
+        if chat_id not in monitored_ids:
+            return
+
+        # Get chat name for the header
         try:
-            # Get channel info
             chat = await event.get_chat()
-            channel_name = getattr(chat, "title", "Unknown")
-            message_text = event.message.text or event.message.message or ""
+            if hasattr(chat, 'title'):
+                chat_name = chat.title
+            else:
+                chat_name = "Unknown"
+        except Exception:
+            chat_name = "Unknown"
 
-            # For messages with media but no text, use caption
-            if not message_text and event.message.media:
-                message_text = "[Media content]"
+        # Get message text
+        message_text = event.message.text or event.message.message or ""
 
-            print(f"📨 New post from: {channel_name}")
-
-            # Check for duplicates
-            if detector.is_duplicate(message_text):
-                print(f"  ❌ Skipped (duplicate)\n")
-                return
-
-            # Not a duplicate! Forward it
-            print(f"  ✅ Unique! Forwarding to {TARGET_CHANNEL}")
-            try:
-                await client.forward_messages(
-                    TARGET_CHANNEL,
-                    event.message
-                )
-                print(f"  📤 Forwarded successfully\n")
-            except Exception as e:
-                print(f"  ⚠️ Forward failed: {e}")
-                # Try sending as text instead
+        # Skip empty messages (images/stickers with no text)
+        if not message_text or len(message_text.strip()) < 5:
+            # Still forward media-only messages (photos, files) without duplicate check
+            if event.message.media:
                 try:
-                    header = f"📺 **{channel_name}**\n\n"
-                    await client.send_message(
-                        TARGET_CHANNEL,
-                        header + message_text,
-                        link_preview=False
-                    )
-                    print(f"  📤 Sent as text instead\n")
-                except Exception as e2:
-                    print(f"  ❌ Also failed to send as text: {e2}\n")
+                    await client.forward_messages(TARGET_CHANNEL, event.message)
+                    print(f"  📎 [{chat_name}] Media forwarded")
+                except Exception as e:
+                    print(f"  ⚠️ [{chat_name}] Media forward failed: {e}")
+            return
 
+        # Check for duplicates
+        if is_duplicate(message_text):
+            print(f"  🔁 [{chat_name}] Duplicate skipped")
+            return
+
+        # Forward unique message!
+        print(f"  ✅ [{chat_name}] Unique! Forwarding...")
+        try:
+            await client.forward_messages(TARGET_CHANNEL, event.message)
+            print(f"  📤 Forwarded successfully\n")
         except Exception as e:
-            print(f"  ❌ Error handling message: {e}\n")
+            print(f"  ⚠️ Forward failed: {e}")
+            # Try sending as text instead
+            try:
+                # Determine emoji based on chat type
+                chat_entity = await event.get_chat()
+                if isinstance(chat_entity, Channel) and chat_entity.broadcast:
+                    emoji = "📺"
+                else:
+                    emoji = "👥"
 
-    # Keep running
-    await client.run_until_disconnected()
+                header = f"{emoji} **{chat_name}**\n\n"
+                await client.send_message(
+                    TARGET_CHANNEL,
+                    header + message_text,
+                    link_preview=False
+                )
+                print(f"  📤 Sent as text instead\n")
+            except Exception as e2:
+                print(f"  ❌ Also failed to send as text: {e2}\n")
 
+    except Exception as e:
+        print(f"  ❌ Error handling message: {e}\n")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+print("\n🎧 Listening for new messages from all channels & groups...\n")
+
+# Keep running forever
+await client.run_until_disconnected()
+```
+
+if **name** == “**main**”:
+asyncio.run(main())
