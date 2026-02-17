@@ -1,11 +1,9 @@
 """
-Telegram Channel & Group Monitor v3
+Telegram Channel & Group Monitor v3.1
 ====================================
 1) All unique messages → TARGET_CHANNEL (기존)
-2) 실적 keyword messages → EARNINGS_CHANNEL (기존)
-3) NEW: 종목 언급 시 거래대금 체크 → VOLUME_ALERT_CHANNEL
-   - 당일 누적 거래대금 >= 1,000억 OR
-   - 최근 5분 거래대금 >= 50억
+2) 실적 keyword messages → EARNINGS_CHANNEL
+3) 종목 언급 시 거래대금 체크 → VOLUME_ALERT_CHANNEL
 """
 
 import os
@@ -211,7 +209,6 @@ class KISApi:
             return None
 
     async def get_stock_price(self, stock_code):
-        """현재가 시세 조회 (누적거래대금 포함)"""
         token = await self.get_token()
         if not token:
             return None
@@ -249,7 +246,6 @@ class KISApi:
             return None
 
     async def get_five_min_volume(self, stock_code):
-        """분봉 조회 -> 최근 5분 거래대금 계산"""
         token = await self.get_token()
         if not token:
             return 0
@@ -301,13 +297,11 @@ def extract_stock_codes(text):
 
     found = set()
 
-    # 6자리 숫자 코드 직접 매칭
     for m in STOCK_CODE_PATTERN.finditer(text):
         code = m.group(1)
         if code != "000000":
             found.add(code)
 
-    # 종목명 매칭 (긴 이름 우선)
     sorted_names = sorted(STOCK_MAP.keys(), key=len, reverse=True)
     for name in sorted_names:
         if name in text or name.upper() in text.upper():
@@ -319,7 +313,7 @@ def extract_stock_codes(text):
 
 
 # ============================================================
-# DUPLICATE DETECTOR
+# DUPLICATE DETECTOR (v3.1 - 버그 수정)
 # ============================================================
 class DuplicateDetector:
     def __init__(self, threshold=0.75, max_history=500, ttl_hours=24):
@@ -328,33 +322,56 @@ class DuplicateDetector:
         self.ttl_seconds = ttl_hours * 3600
         self.seen_hashes = {}
         self.seen_texts = []
+        self.stats = {"total": 0, "unique": 0, "duplicate": 0, "skipped": 0}
 
     def _clean_old(self):
         now = time.time()
+        old_count = len(self.seen_hashes)
         self.seen_hashes = {
             k: v for k, v in self.seen_hashes.items()
             if now - v < self.ttl_seconds
         }
         cutoff = max(0, len(self.seen_texts) - self.max_history)
         self.seen_texts = self.seen_texts[cutoff:]
+        cleaned = old_count - len(self.seen_hashes)
+        if cleaned > 0:
+            print(f"  🧹 Cleaned {cleaned} old entries")
 
     def _get_hash(self, text):
         cleaned = "".join(text.lower().split())
         return hashlib.md5(cleaned.encode()).hexdigest()
 
     def is_duplicate(self, text):
-        if not text or len(text.strip()) < 5:
+        self.stats["total"] += 1
+
+        # FIX 1: 빈 메시지만 스킵, 짧은 메시지는 통과시킴
+        if not text or text.strip() == "":
+            self.stats["skipped"] += 1
             return True
+
         self._clean_old()
         text_hash = self._get_hash(text)
+
+        # 완전 동일 메시지 체크
         if text_hash in self.seen_hashes:
+            self.stats["duplicate"] += 1
             return True
-        for old_text in self.seen_texts:
-            if SequenceMatcher(None, text.lower(), old_text.lower()).ratio() >= self.threshold:
-                return True
+
+        # 유사도 체크 (짧은 메시지는 유사도 체크 스킵 - 오탐 방지)
+        if len(text.strip()) > 20:
+            for old_text in self.seen_texts:
+                if SequenceMatcher(None, text.lower(), old_text.lower()).ratio() >= self.threshold:
+                    self.stats["duplicate"] += 1
+                    return True
+
+        # 고유 메시지 등록
         self.seen_hashes[text_hash] = time.time()
         self.seen_texts.append(text)
+        self.stats["unique"] += 1
         return False
+
+    def get_stats(self):
+        return self.stats
 
 
 def contains_earnings_keyword(text):
@@ -365,7 +382,7 @@ def contains_earnings_keyword(text):
 
 
 # ============================================================
-# 알림 쿨다운 (같은 종목 15분 내 재알림 방지)
+# 알림 쿨다운
 # ============================================================
 class AlertCooldown:
     def __init__(self, cooldown_minutes=15):
@@ -388,12 +405,19 @@ class AlertCooldown:
 # ============================================================
 async def main():
     print("=" * 55)
-    print("  Telegram Monitor v3")
+    print("  Telegram Monitor v3.1")
     print("  + Earnings Filter + Volume Alert")
+    print("  + Bug fixes for message forwarding")
     print("=" * 55)
 
     if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
-        print("\n❌ Missing: API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL")
+        missing = []
+        if not API_ID: missing.append("API_ID")
+        if not API_HASH: missing.append("API_HASH")
+        if not SESSION_STRING: missing.append("SESSION_STRING")
+        if not TARGET_CHANNEL: missing.append("TARGET_CHANNEL")
+        print(f"\n❌ Missing: {', '.join(missing)}")
+        print("Please set these environment variables in Railway")
         return
 
     kis_ok = all([KIS_APP_KEY, KIS_APP_SECRET, VOLUME_ALERT_CHANNEL])
@@ -427,26 +451,28 @@ async def main():
     for ch in [TARGET_CHANNEL, EARNINGS_CHANNEL, VOLUME_ALERT_CHANNEL]:
         if ch:
             try:
-                exclude_ids.add((await client.get_entity(ch)).id)
-            except Exception:
-                pass
+                ent = await client.get_entity(ch)
+                exclude_ids.add(ent.id)
+                print(f"  ✅ Output channel: {ch} (id: {ent.id})")
+            except Exception as e:
+                print(f"  ❌ Cannot find channel {ch}: {e}")
 
     async for dialog in client.iter_dialogs():
         e = dialog.entity
         if isinstance(e, Channel) and e.broadcast and e.id not in exclude_ids:
             monitored_ids.add(e.id)
-            print(f"  📺 {dialog.name}")
+            print(f"  📺 {dialog.name} (id: {e.id})")
             ch_count += 1
         elif isinstance(e, Channel) and e.megagroup and e.id not in exclude_ids:
             monitored_ids.add(e.id)
-            print(f"  👥 {dialog.name}")
+            print(f"  👥 {dialog.name} (id: {e.id})")
             grp_count += 1
         elif isinstance(e, Chat):
             monitored_ids.add(e.id)
-            print(f"  👥 {dialog.name}")
+            print(f"  👥 {dialog.name} (id: {e.id})")
             grp_count += 1
 
-    print(f"\n📊 Monitoring: {ch_count} channels + {grp_count} groups")
+    print(f"\n📊 Monitoring: {ch_count} channels + {grp_count} groups = {len(monitored_ids)} total")
     print(f"📬 All unique → {TARGET_CHANNEL}")
     if EARNINGS_CHANNEL:
         print(f"📈 실적 → {EARNINGS_CHANNEL}")
@@ -454,33 +480,70 @@ async def main():
         print(f"💰 거래대금 → {VOLUME_ALERT_CHANNEL}")
         print(f"   기준: 누적 >= {DAILY_VOLUME_THRESHOLD/1e8:.0f}억 or 5분 >= {FIVE_MIN_THRESHOLD/1e8:.0f}억")
 
+    # 통계 출력 (10분마다)
+    async def print_stats():
+        while True:
+            await asyncio.sleep(600)
+            stats = detector.get_stats()
+            print(f"\n📊 Stats: total={stats['total']} unique={stats['unique']} dup={stats['duplicate']} skip={stats['skipped']}")
+            print(f"   Cache: {len(detector.seen_hashes)} hashes, {len(detector.seen_texts)} texts\n")
+
+    asyncio.create_task(print_stats())
+
     # --------------------------------------------------------
     @client.on(events.NewMessage())
     async def handler(event):
         try:
-            if event.chat_id not in monitored_ids:
+            chat_id = event.chat_id
+            if chat_id not in monitored_ids:
                 return
 
             chat = await event.get_chat()
             chat_name = getattr(chat, "title", "Unknown")
-            msg = event.message.text or ""
-            if not msg and event.message.media:
-                msg = "[Media]"
 
+            # FIX 2: 미디어 메시지 처리 개선
+            msg = event.message.text or ""
+            has_media = event.message.media is not None
+            is_media_only = (not msg) and has_media
+
+            # 미디어만 있는 메시지는 중복 체크 없이 바로 포워딩
+            if is_media_only:
+                print(f"📎 [{chat_name}] Media message → forwarding")
+                try:
+                    await client.forward_messages(TARGET_CHANNEL, event.message)
+                    print(f"  ✅ Forwarded media to {TARGET_CHANNEL}")
+                except Exception as e:
+                    print(f"  ❌ Forward media failed: {e}")
+                    try:
+                        await client.send_message(TARGET_CHANNEL, f"📎 **{chat_name}**\n\n[미디어 메시지]", link_preview=False)
+                    except Exception as e2:
+                        print(f"  ❌ Fallback also failed: {e2}")
+                return
+
+            # 텍스트 메시지 중복 체크
             if detector.is_duplicate(msg):
                 return
 
-            print(f"📨 [{chat_name}] Unique msg")
+            print(f"📨 [{chat_name}] Unique msg ({len(msg)} chars)")
 
-            # 1) Main channel
+            # 1) Main channel - 포워딩
+            forwarded = False
             try:
                 await client.forward_messages(TARGET_CHANNEL, event.message)
-            except Exception:
+                forwarded = True
+                print(f"  ✅ Forwarded to {TARGET_CHANNEL}")
+            except Exception as e:
+                print(f"  ⚠️ Forward failed: {e}")
                 try:
                     em = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
                     await client.send_message(TARGET_CHANNEL, f"{em} **{chat_name}**\n\n{msg}", link_preview=False)
-                except Exception:
-                    pass
+                    forwarded = True
+                    print(f"  ✅ Sent as copy to {TARGET_CHANNEL}")
+                except Exception as e2:
+                    print(f"  ❌ Send also failed: {e2}")
+
+            if not forwarded:
+                print(f"  ❌ FAILED to deliver message to {TARGET_CHANNEL}!")
 
             # 2) Earnings channel
             if EARNINGS_CHANNEL and contains_earnings_keyword(msg):
@@ -488,14 +551,16 @@ async def main():
                 print(f"  📈 실적: {matched}")
                 try:
                     await client.forward_messages(EARNINGS_CHANNEL, event.message)
-                except Exception:
+                    print(f"  ✅ Forwarded to {EARNINGS_CHANNEL}")
+                except Exception as e:
+                    print(f"  ⚠️ Earnings forward failed: {e}")
                     try:
                         await client.send_message(EARNINGS_CHANNEL, f"📈 **[실적] {chat_name}**\n🔑 {', '.join(matched)}\n\n{msg}", link_preview=False)
-                    except Exception:
-                        pass
+                    except Exception as e2:
+                        print(f"  ❌ Earnings send failed: {e2}")
 
             # 3) Volume alert
-            if kis and msg != "[Media]":
+            if kis and msg:
                 codes = extract_stock_codes(msg)
                 for code in codes[:3]:
                     if not cooldown.can_alert(code):
@@ -542,9 +607,11 @@ async def main():
                     await asyncio.sleep(0.2)
 
         except Exception as e:
-            print(f"  ❌ Error: {e}")
+            print(f"  ❌ Handler error: {e}")
+            import traceback
+            traceback.print_exc()
 
-    print(f"\n🎧 Listening...\n")
+    print(f"\n🎧 Listening... (v3.1)\n")
     await client.run_until_disconnected()
     if kis:
         await kis.close()
