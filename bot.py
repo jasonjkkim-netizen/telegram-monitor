@@ -1,27 +1,21 @@
 """
-Telegram Channel & Group Monitor v6.0
+Telegram Channel & Group Monitor v6.1
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
-BOT 3: 종목 언급 + 거래대금 >= 10억 실시간 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+BOT 3: 종목 언급 + 20분 거래대금 >= 10억 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v6.1 Changes:
+    - Changed BOT 3 volume check from cumulative daily (acml_tr_pbmn) to
+      rolling 20-minute window using minute-candle API (FHKST03010200)
+    - Added get_rolling_volume() method: sums vol*price from last 20 one-minute candles
+    - Alert message now shows "20분 거래대금" instead of "누적거래대금"
 
 v6.0 Fixes:
-    - Fixed aiohttp session: removed base_url (not supported in all versions),
-      using full URLs instead
-    - Fixed KIS API: removed get_realtime_volume (unreliable minute-candle calc),
-      now uses acml_tr_pbmn from inquire-price as the volume threshold
-    - Fixed BOT 3: earnings keyword check was missing, so volume alerts fired
-      on ALL messages mentioning stocks, not just earnings-related ones.
-      Now BOT 3 only runs INSIDE the BOT 2 earnings block.
-    - Fixed chat_id vs peer_id mismatch: handler now uses peer_id consistently
-    - Fixed forward_messages: added FloodWaitError handling with auto retry
-    - Fixed asyncio.run() compatibility: wrapped in try/except for event loop
-    - Added connection_retries and retry_delay to TelegramClient for stability
-    - Added graceful shutdown with background task cancellation
-    - Added timeout to aiohttp session to prevent hanging requests
-    - Added sys import for sys.exit(1) on fatal error
-    - Added telethon.errors import for FloodWaitError handling
-    - Removed DAILY_VOLUME_THRESHOLD (unnecessary, simplified to single threshold)
+    - Fixed aiohttp session: removed base_url, using full URLs
+    - Fixed BOT 3: only runs inside BOT 2 earnings block
+    - Fixed chat_id vs peer_id mismatch
+    - Added FloodWaitError handling, connection retries, graceful shutdown
 """
 
 import os
@@ -54,8 +48,8 @@ KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
 KIS_ACCOUNT_NO = os.environ.get("KIS_ACCOUNT_NO", "")
 KIS_ACCOUNT_PROD = os.environ.get("KIS_ACCOUNT_PROD", "01")
 
-# 거래대금 기준: BOT 3 실시간 10억원 (1,000,000,000 KRW)
-REALTIME_VOLUME_THRESHOLD = int(os.environ.get("REALTIME_VOLUME_THRESHOLD", "1000000000"))
+# 거래대금 기준: 20분 rolling 10억원 (1,000,000,000 KRW)
+VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "1000000000"))
 
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 # ============================================================
@@ -215,7 +209,6 @@ class KISApi:
         self.session = None
 
     async def ensure_session(self):
-        """Create aiohttp session WITHOUT base_url for max compatibility."""
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=10)
             self.session = aiohttp.ClientSession(timeout=timeout)
@@ -248,7 +241,7 @@ class KISApi:
             return None
 
     async def get_stock_price(self, stock_code):
-        """현재가 + 누적 거래대금 조회 (acml_tr_pbmn = 누적거래대금)"""
+        """현재가 조회"""
         token = await self.get_token()
         if not token:
             return None
@@ -288,6 +281,59 @@ class KISApi:
             print(f"❌ 시세에러 [{stock_code}]: {e}")
             return None
 
+    async def get_rolling_volume(self, stock_code, minutes=20):
+        """
+        최근 N분 rolling 거래대금 조회.
+        주식당일분봉조회 (FHKST03010200) API를 사용하여
+        1분봉 데이터의 체결량 x 체결가 합산.
+        Returns: 거래대금 (won), 0 on error
+        """
+        token = await self.get_token()
+        if not token:
+            return 0
+
+        await self.ensure_session()
+        url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        headers = {
+            "authorization": f"Bearer {token}",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET,
+            "tr_id": "FHKST03010200",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        now = datetime.now()
+        params = {
+            "FID_ETC_CLS_CODE": "",
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
+            "FID_PW_DATA_INCU_YN": "N",
+        }
+        try:
+            async with self.session.get(url, headers=headers, params=params) as resp:
+                data = await resp.json()
+                if data.get("rt_cd") == "0":
+                    items = data.get("output2", [])
+                    total = 0
+                    count = 0
+                    for item in items:
+                        if count >= minutes:
+                            break
+                        vol = int(item.get("cntg_vol", "0"))
+                        price = int(item.get("stck_prpr", "0"))
+                        total += vol * price
+                        count += 1
+                    return total
+                else:
+                    print(f"⚠️ 분봉실패 [{stock_code}]: {data.get('msg1','')}")
+                    return 0
+        except asyncio.TimeoutError:
+            print(f"⚠️ 분봉 타임아웃 [{stock_code}]")
+            return 0
+        except Exception as e:
+            print(f"❌ 분봉에러 [{stock_code}]: {e}")
+            return 0
+
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
@@ -313,9 +359,6 @@ def extract_stock_codes(text):
     return list(found)
 
 
-# ============================================================
-# 크립토 필터 (BOT 1)
-# ============================================================
 def contains_crypto_keyword(text):
     if not text:
         return False
@@ -323,9 +366,6 @@ def contains_crypto_keyword(text):
     return any(kw in lower for kw in CRYPTO_KEYWORDS)
 
 
-# ============================================================
-# 실적/공시 키워드 체크 (BOT 2)
-# ============================================================
 def contains_earnings_keyword(text):
     if not text:
         return False
@@ -391,9 +431,6 @@ class DuplicateDetector:
         return self.stats
 
 
-# ============================================================
-# 알림 쿨다운
-# ============================================================
 class AlertCooldown:
     def __init__(self, cooldown_minutes=30):
         self.cooldown = cooldown_minutes * 60
@@ -408,22 +445,18 @@ class AlertCooldown:
 
     def reset(self, stock_code):
         self.last_alert.pop(stock_code, None)
-# ============================================================
-# Safe send/forward with flood wait handling
-# ============================================================
+
+
 async def safe_forward(client, channel, message, max_retries=2):
     for attempt in range(max_retries):
         try:
             await client.forward_messages(channel, message)
             return True
         except errors.FloodWaitError as e:
-            wait = e.seconds + 1
-            print(f"⚠️ FloodWait: waiting {wait}s...")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(e.seconds + 1)
         except Exception as e:
             if attempt == 0:
                 raise
-            print(f"❌ Forward retry failed: {e}")
             return False
     return False
 
@@ -434,13 +467,10 @@ async def safe_send(client, channel, text, max_retries=2, **kwargs):
             await client.send_message(channel, text, **kwargs)
             return True
         except errors.FloodWaitError as e:
-            wait = e.seconds + 1
-            print(f"⚠️ FloodWait: waiting {wait}s...")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(e.seconds + 1)
         except Exception as e:
             if attempt == 0:
                 raise
-            print(f"❌ Send retry failed: {e}")
             return False
     return False
 # ============================================================
@@ -448,10 +478,10 @@ async def safe_send(client, channel, text, max_retries=2, **kwargs):
 # ============================================================
 async def main():
     print("=" * 60)
-    print("  Telegram Monitor v6.0")
+    print("  Telegram Monitor v6.1")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print("  BOT2: 실적/공시 -> @jason_earnings")
-    print("  BOT3: 거래대금 >= 10억 -> @alerts_forme")
+    print("  BOT3: 20분 거래대금 >= 10억 -> @alerts_forme")
     print("=" * 60)
 
     if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
@@ -544,9 +574,10 @@ async def main():
     if EARNINGS_CHANNEL:
         print(f"📈 실적/공시 -> {EARNINGS_CHANNEL}")
     if kis:
-        print(f"🚨 거래대금 >= {REALTIME_VOLUME_THRESHOLD/100000000:.0f}억 -> {VOLUME_ALERT_CHANNEL}")
+        print(f"🚨 20분 거래대금 >= {VOLUME_THRESHOLD/100000000:.0f}억 -> {VOLUME_ALERT_CHANNEL}")
 
     bg_tasks = []
+
     async def print_stats():
         try:
             while True:
@@ -554,8 +585,6 @@ async def main():
                 stats = detector.get_stats()
                 print(f"📊 Stats: total={stats['total']} unique={stats['unique']} "
                       f"dup={stats['duplicate']} skip={stats['skipped']}")
-                print(f"   Cache: {len(detector.seen_hashes)} hashes, "
-                      f"{len(detector.seen_texts)} texts")
         except asyncio.CancelledError:
             pass
 
@@ -567,10 +596,7 @@ async def main():
                 await asyncio.sleep(1800)
                 print("🔄 Refreshing dialog list...")
                 added = await refresh_dialogs()
-                if added:
-                    print(f"  ✅ Added {added} new chats (total: {len(monitored_ids)})")
-                else:
-                    print(f"  ✅ No new chats (total: {len(monitored_ids)})")
+                print(f"  ✅ {added} new, total: {len(monitored_ids)}")
         except asyncio.CancelledError:
             pass
 
@@ -585,16 +611,13 @@ async def main():
             except Exception:
                 return
 
-            # Skip our own output channels
             if peer_id in exclude_ids:
                 return
 
-            # Dynamic enrollment
             if peer_id not in monitored_ids:
                 if isinstance(chat, (Channel, Chat)):
                     monitored_ids.add(peer_id)
-                    chat_name = getattr(chat, "title", "Unknown")
-                    print(f"  🆕 Dynamically added: {chat_name}")
+                    print(f"  🆕 Dynamically added: {getattr(chat, 'title', 'Unknown')}")
                 else:
                     return
 
@@ -603,30 +626,24 @@ async def main():
             has_media = event.message.media is not None
             is_media_only = (not msg) and has_media
 
-            # ====== BOT 1: Media-only messages ======
+            # ====== BOT 1: Media-only ======
             if is_media_only:
-                print(f"📎 [{chat_name}] Media message -> forwarding")
                 try:
                     await safe_forward(client, TARGET_CHANNEL, event.message)
-                    print(f"  ✅ Forwarded media to {TARGET_CHANNEL}")
-                except Exception as e:
+                except Exception:
                     try:
                         icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
-                        await safe_send(
-                            client, TARGET_CHANNEL,
+                        await safe_send(client, TARGET_CHANNEL,
                             f"📎 {icon}**{chat_name}** [미디어 메시지]",
-                            link_preview=False,
-                        )
-                    except Exception as e2:
-                        print(f"  ❌ Media fallback failed: {e2}")
+                            link_preview=False)
+                    except Exception:
+                        pass
                 return
 
-            # ====== BOT 1: Text messages ======
-            # Filter out crypto/coin messages
+            # ====== BOT 1: Text - filter crypto, dedup ======
             if contains_crypto_keyword(msg):
                 return
 
-            # Dedup check
             if detector.is_duplicate(msg):
                 return
 
@@ -638,76 +655,69 @@ async def main():
                 forwarded = True
                 print(f"  ✅ Forwarded to {TARGET_CHANNEL}")
             except Exception as e:
-                print(f"  ⚠️ Forward failed: {e}")
                 try:
                     icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
-                    await safe_send(
-                        client, TARGET_CHANNEL,
-                        f"{icon}**{chat_name}**\n{msg}",
-                        link_preview=False,
-                    )
+                    await safe_send(client, TARGET_CHANNEL,
+                        f"{icon}**{chat_name}**\n{msg}", link_preview=False)
                     forwarded = True
-                    print(f"  ✅ Sent as copy to {TARGET_CHANNEL}")
-                except Exception as e2:
-                    print(f"  ❌ Send also failed: {e2}")
+                except Exception:
+                    pass
 
             if not forwarded:
                 print(f"  ❌ FAILED to deliver to {TARGET_CHANNEL}!")
-            # ====== BOT 2: 실적/공시 channel ======
+            # ====== BOT 2: 실적/공시 ======
             if EARNINGS_CHANNEL and contains_earnings_keyword(msg):
                 matched = [kw for kw in EARNINGS_KEYWORDS if kw.lower() in msg.lower()][:3]
-                print(f"  📈 실적/공시 키워드: {matched}")
+                print(f"  📈 실적/공시: {matched}")
                 try:
                     await safe_forward(client, EARNINGS_CHANNEL, event.message)
-                    print(f"  ✅ Forwarded to {EARNINGS_CHANNEL}")
-                except Exception as e:
-                    print(f"  ⚠️ Earnings forward failed: {e}")
+                    print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                except Exception:
                     try:
-                        await safe_send(
-                            client, EARNINGS_CHANNEL,
+                        await safe_send(client, EARNINGS_CHANNEL,
                             f"📈 **[실적/공시]** {chat_name}\n"
-                            f"🔑 키워드: {', '.join(matched)}\n\n{msg[:500]}",
-                            link_preview=False,
-                        )
-                    except Exception as e2:
-                        print(f"  ❌ Earnings send failed: {e2}")
+                            f"🔑 {', '.join(matched)}\n\n{msg[:500]}",
+                            link_preview=False)
+                    except Exception:
+                        pass
 
-                # ====== BOT 3: Volume alert (INSIDE earnings block) ======
+                # ====== BOT 3: 20분 rolling 거래대금 체크 ======
                 if kis and msg:
                     codes = extract_stock_codes(msg)
                     for code in codes:
                         if not cooldown.can_alert(code):
                             continue
 
+                        # 1) 현재가 조회
                         price_info = await kis.get_stock_price(code)
                         if not price_info:
                             cooldown.reset(code)
                             continue
 
                         name = price_info["name"] or code
-                        acml = price_info["acml_tr_pbmn"]
 
-                        print(f"  💰 [{code}] {name} 누적거래대금: "
-                              f"{acml/100000000:.1f}억")
+                        # 2) 20분 rolling 거래대금 조회
+                        rolling_vol = await kis.get_rolling_volume(code, minutes=20)
 
-                        # Threshold: 누적 거래대금 >= 10억원
-                        if acml >= REALTIME_VOLUME_THRESHOLD:
+                        print(f"  💰 [{code}] {name} 20분 거래대금: "
+                              f"{rolling_vol/100000000:.2f}억")
+
+                        # 기준: 20분 rolling 거래대금 >= 10억원
+                        if rolling_vol >= VOLUME_THRESHOLD:
                             alert = (
                                 f"🚨 **거래대금 매수신호 알림**\n"
                                 f"📌 **{name}** ({code})\n"
                                 f"💰 현재가: {price_info['price']:,}원 "
                                 f"({price_info['change_rate']}%)\n"
-                                f"📊 누적거래대금: {acml/100000000:.1f}억\n"
+                                f"📊 20분 거래대금: {rolling_vol/100000000:.1f}억\n"
                                 f"📍 누적거래량: {price_info['acml_vol']:,}주\n"
                                 f"💬 출처: {chat_name}\n"
                                 f"⏰ {datetime.now().strftime('%H:%M:%S')}"
                             )
                             try:
-                                await safe_send(
-                                    client, VOLUME_ALERT_CHANNEL,
-                                    alert, link_preview=False,
-                                )
-                                print(f"  🚨 ALERT SENT for {name} ({code}) ✅")
+                                await safe_send(client, VOLUME_ALERT_CHANNEL,
+                                    alert, link_preview=False)
+                                print(f"  🚨 ALERT: {name} ({code}) ✅")
                             except Exception as e:
                                 print(f"  ❌ Alert failed: {e}")
                         else:
@@ -716,13 +726,12 @@ async def main():
                         await asyncio.sleep(0.2)
 
         except errors.FloodWaitError as e:
-            print(f"  ⚠️ Handler FloodWait: sleeping {e.seconds}s")
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
             print(f"  ❌ Handler error: {e}")
             import traceback
             traceback.print_exc()
-    print(f"🎧 Listening... (v6.0)")
+    print(f"🎧 Listening... (v6.1)")
 
     try:
         await client.run_until_disconnected()
