@@ -1,9 +1,14 @@
 """
-Telegram Channel & Group Monitor v7.1
+Telegram Channel & Group Monitor v7.2
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v7.2 Changes:
+    - Fixed BOT 3: stock name now reliably shown in alerts
+    - Added stock_universe.lookup_name() fallback when KIS API returns code instead of name
+    - Name resolution priority: KIS API name > stock universe name > stock code
 
 v7.1 Changes:
     - Added OCR: extracts stock names from image messages (Tesseract + Korean)
@@ -712,7 +717,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 # ============================================================
 async def main():
     print("=" * 50)
-    print("  Telegram Monitor v7.1")
+    print("  Telegram Monitor v7.2")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print("  BOT2: \uc2e4\uc801/\uacf5\uc2dc -> @jason_earnings")
     print("  BOT3: \uc885\ubaa9\ubcc4 \uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA + OCR -> @alerts_forme")
@@ -947,7 +952,15 @@ async def main():
                         cooldown.reset(code)
                         continue
 
-                    name = price_info.get("name", code)
+                    api_name = price_info.get("name", "")
+                    universe_name = stock_universe.lookup_name(code) or ""
+                    # Use API name if it's a real name (not just the code), otherwise use universe name
+                    if api_name and api_name != code and not api_name.isdigit():
+                        name = api_name
+                    elif universe_name:
+                        name = universe_name
+                    else:
+                        name = code
 
                     # 2) 20\ubd84 rolling \uac70\ub798\ub300\uae08
                     rolling_vol = await kis.get_rolling_volume(code, minutes=20)
@@ -1021,7 +1034,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.1)")
+    print(f"\U0001f3a7 Listening... (v7.2)")
 
     try:
         await client.run_until_disconnected()
