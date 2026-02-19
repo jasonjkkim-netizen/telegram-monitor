@@ -1,3 +1,5 @@
 telethon==1.42.0
 cryptg
 aiohttp
+Pillow
+pytesseract
