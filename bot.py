@@ -1,23 +1,27 @@
 """
-Telegram Channel & Group Monitor v7.0
+Telegram Channel & Group Monitor v7.1
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v7.1 Changes:
+    - Added OCR: extracts stock names from image messages (Tesseract + Korean)
+    - Replaced hardcoded STOCK_MAP with dynamic universe from KIS master files
+    - Downloads kospi_code.mst.zip + kosdaq_code.mst.zip at startup
+    - Refreshes stock universe every 24 hours
+    - BOT 3 now processes both text AND image messages for stock detection
 
 v7.0 Changes:
     - Redesigned BOT 3: now alerts on EVERY stock mention (not just volume threshold)
     - BOT 3 now shows: price, change rate, aggregated volume,
       RISK level (based on price change %), and moving average state
     - Added get_daily_close_prices() for MA calculation (5/20/60 day)
-    - Added compute_risk_level() for RISK indicator
-    - Added compute_ma_state() for moving average crossover state
     - BOT 3 runs independently from BOT 2 (not nested inside earnings block)
 
 v6.1 Changes:
     - Changed BOT 3 volume check from cumulative daily (acml_tr_pbmn) to
       rolling 20-minute window using minute-candle API (FHKST03010200)
-    - Added get_rolling_volume() method: sums vol*price from last 20 one-minute candles
 
 v6.0 Fixes:
     - Fixed aiohttp session: removed base_url, using full URLs
@@ -29,6 +33,8 @@ v6.0 Fixes:
 import os
 import re
 import sys
+import io
+import zipfile
 import asyncio
 import hashlib
 import time
@@ -39,6 +45,26 @@ from difflib import SequenceMatcher
 from telethon import TelegramClient, events, utils, errors
 from telethon.sessions import StringSession
 from telethon.types import Channel, Chat
+
+# OCR imports (optional - graceful fallback if not available)
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+    # Heroku apt buildpack installs to /app/.apt/usr/bin
+    tesseract_paths = [
+        "/app/.apt/usr/bin/tesseract",
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+    ]
+    for tp in tesseract_paths:
+        if os.path.exists(tp):
+            pytesseract.pytesseract.tesseract_cmd = tp
+            break
+    print(f"\u2705 OCR available (Tesseract)")
+except ImportError:
+    OCR_AVAILABLE = False
+    print("\u26a0\ufe0f OCR not available (install Pillow + pytesseract)")
 
 # ============================================================
 # CONFIGURATION
@@ -57,9 +83,13 @@ KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET")
 KIS_ACCOUNT_NO = os.environ.get("KIS_ACCOUNT_NO")
 KIS_ACCOUNT_PROD = os.environ.get("KIS_ACCOUNT_PROD", "01")
 
-# 거래대금 기준: 20분 rolling 10억원 (1,000,000,000 KRW)
+# 거래대금 기준
 VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "1000000000"))
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+
+# KIS 종목정보파일 URLs
+KIS_KOSPI_MST_URL = "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
+KIS_KOSDAQ_MST_URL = "https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip"
 
 # ============================================================
 # CRYPTO FILTER KEYWORDS (BOT 1)
@@ -75,142 +105,220 @@ CRYPTO_KEYWORDS = [
     "metamask", "uniswap", "pancakeswap",
     "cardano", "ada", "polkadot", "dot", "avalanche", "avax",
     "bnb", "tron", "trx", "shiba", "pepe",
-    "비트코인", "이더리움", "가상화폐", "암호화폐", "코인", "토큰",
-    "블록체인", "디파이", "엔에프티", "알트코인",
-    "업비트", "빗썸", "리플", "솔라나", "도지코인",
-    "스테이킹", "채굴", "지갑", "코인마켓", "가상자산",
-    "디지털자산", "바이난스", "에어드롭",
+    "\ube44\ud2b8\ucf54\uc778", "\uc774\ub354\ub9ac\uc6c0", "\uac00\uc0c1\ud654\ud3d0", "\uc554\ud638\ud654\ud3d0", "\ucf54\uc778", "\ud1a0\ud070",
+    "\ube14\ub85d\uccb4\uc778", "\ub514\ud30c\uc774", "\uc564\uc5d0\ud504\ud2f0", "\uc54c\ud2b8\ucf54\uc778",
+    "\uc5c5\ube44\ud2b8", "\ube57\uc378", "\ub9ac\ud50c", "\uc194\ub77c\ub098", "\ub3c4\uc9c0\ucf54\uc778",
+    "\uc2a4\ud14c\uc774\ud0b9", "\ucc44\uad74", "\uc9c0\uac11", "\ucf54\uc778\ub9c8\ucf13", "\uac00\uc0c1\uc790\uc0b0",
+    "\ub514\uc9c0\ud138\uc790\uc0b0", "\ubc14\uc774\ub09c\uc2a4", "\uc5d0\uc5b4\ub4dc\ub86d",
 ]
 
 # ============================================================
-# 실적 + 공시 KEYWORDS (BOT 2)
+# \uc2e4\uc801 + \uacf5\uc2dc KEYWORDS (BOT 2)
 # ============================================================
 EARNINGS_KEYWORDS = [
-    "실적", "잠정실적", "실적발표", "실적공시", "실적추정", "실적전망",
-    "실적시즌", "실적쇼크", "실적서프라이즈",
-    "어닝쇼크", "어닝서프라이즈", "컨센서스",
-    "영업이익", "당기순이익", "순이익", "매출액", "매출",
-    "영업손실", "순손실", "당기순손실",
-    "적자전환", "흑자전환", "적자지속", "흑자지속",
-    "분기실적", "1분기", "2분기", "3분기", "4분기",
+    "\uc2e4\uc801", "\uc7a0\uc815\uc2e4\uc801", "\uc2e4\uc801\ubc1c\ud45c", "\uc2e4\uc801\uacf5\uc2dc", "\uc2e4\uc801\ucd94\uc815", "\uc2e4\uc801\uc804\ub9dd",
+    "\uc2e4\uc801\uc2dc\uc98c", "\uc2e4\uc801\uc1fc\ud06c", "\uc2e4\uc801\uc11c\ud504\ub77c\uc774\uc988",
+    "\uc5b4\ub2dd\uc1fc\ud06c", "\uc5b4\ub2dd\uc11c\ud504\ub77c\uc774\uc988", "\ucee8\uc13c\uc11c\uc2a4",
+    "\uc601\uc5c5\uc774\uc775", "\ub2f9\uae30\uc21c\uc774\uc775", "\uc21c\uc774\uc775", "\ub9e4\ucd9c\uc561", "\ub9e4\ucd9c",
+    "\uc601\uc5c5\uc190\uc2e4", "\uc21c\uc190\uc2e4", "\ub2f9\uae30\uc21c\uc190\uc2e4",
+    "\uc801\uc790\uc804\ud658", "\ud751\uc790\uc804\ud658", "\uc801\uc790\uc9c0\uc18d", "\ud751\uc790\uc9c0\uc18d",
+    "\ubd84\uae30\uc2e4\uc801", "1\ubd84\uae30", "2\ubd84\uae30", "3\ubd84\uae30", "4\ubd84\uae30",
     "1Q", "2Q", "3Q", "4Q",
-    "반기실적", "연간실적",
-    "영업이익률", "순이익률", "매출총이익",
+    "\ubc18\uae30\uc2e4\uc801", "\uc5f0\uac04\uc2e4\uc801",
+    "\uc601\uc5c5\uc774\uc775\ub960", "\uc21c\uc774\uc775\ub960", "\ub9e4\ucd9c\ucd1d\uc774\uc775",
     "EBITDA", "EPS", "BPS", "ROE", "ROA", "PER", "PBR",
-    "전년대비", "전분기대비", "YoY", "QoQ",
-    "잠정치", "확정치", "연결기준", "별도기준",
-    "사업보고서", "분기보고서", "반기보고서",
-    "공시", "공시내용", "수시공시", "주요공시",
-    "판매량", "판매실적", "수주", "수주잔고", "수주액",
+    "\uc804\ub144\ub300\ube44", "\uc804\ubd84\uae30\ub300\ube44", "YoY", "QoQ",
+    "\uc7a0\uc815\uce58", "\ud655\uc815\uce58", "\uc5f0\uacb0\uae30\uc900", "\ubcc4\ub3c4\uae30\uc900",
+    "\uc0ac\uc5c5\ubcf4\uace0\uc11c", "\ubd84\uae30\ubcf4\uace0\uc11c", "\ubc18\uae30\ubcf4\uace0\uc11c",
+    "\uacf5\uc2dc", "\uacf5\uc2dc\ub0b4\uc6a9", "\uc218\uc2dc\uacf5\uc2dc", "\uc8fc\uc694\uacf5\uc2dc",
+    "\ud310\ub9e4\ub7c9", "\ud310\ub9e4\uc2e4\uc801", "\uc218\uc8fc", "\uc218\uc8fc\uc794\uace0", "\uc218\uc8fc\uc561",
 ]
 
 # ============================================================
-# 종목명 -> 종목코드 매핑
+# DYNAMIC STOCK UNIVERSE (replaces hardcoded STOCK_MAP)
 # ============================================================
-STOCK_MAP = {
-    "삼성전자": "005930", "삼전": "005930",
-    "SK하이닉스": "000660", "하이닉스": "000660", "하닉": "000660",
-    "LG에너지솔루션": "373220", "엘지에솔": "373220",
-    "삼성바이오로직스": "207940", "삼바": "207940",
-    "현대차": "005380", "현대자동차": "005380",
-    "기아": "000270", "기아차": "000270",
-    "셀트리온": "068270",
-    "KB금융": "105560",
-    "신한지주": "055550",
-    "POSCO홀딩스": "005490", "포스코홀딩스": "005490", "포스코": "005490",
-    "NAVER": "035420", "네이버": "035420",
-    "카카오": "035720",
-    "삼성SDI": "006400",
-    "현대모비스": "012330",
-    "LG화학": "051910", "엘지화학": "051910",
-    "삼성물산": "028260",
-    "SK이노베이션": "096770",
-    "삼성생명": "032830",
-    "하나금융지주": "086790", "하나금융": "086790",
-    "우리금융지주": "316140", "우리금융": "316140",
-    "LG전자": "066570", "엘지전자": "066570",
-    "카카오뱅크": "323410",
-    "삼성화재": "000810",
-    "KT&G": "033780",
-    "HD현대중공업": "329180",
-    "삼성전기": "009150",
-    "SK텔레콤": "017670", "SKT": "017670",
-    "KT": "030200",
-    "LG": "003550",
-    "SK": "034730",
-    "한화에어로스페이스": "012450", "한화에어로": "012450",
-    "HD한국조선해양": "009540",
-    "두산에너빌리티": "034020",
-    "크래프톤": "259960",
-    "한국전력": "015760", "한전": "015760",
-    "SK스퀘어": "402340",
-    "한화오션": "042660",
-    "HD현대일렉트릭": "267260",
-    "메리츠금융지주": "138040", "메리츠금융": "138040",
-    "에코프로비엠": "247540",
-    "에코프로": "086520",
-    "포스코퓨처엠": "003670",
-    "LG이노텍": "011070",
-    "한미반도체": "042700",
-    "고려아연": "010130",
-    "금양": "001570",
-    "HLB": "028300",
-    "알테오젠": "196170",
-    "리가케미바이오": "141080",
-    "SK바이오팜": "326030",
-    "두산밥캣": "241560",
-    "CJ제일제당": "097950",
-    "아모레퍼시픽": "090430",
-    "한화솔루션": "009830",
-    "삼성중공업": "010140",
-    "대한항공": "003490",
-    "현대건설": "000720",
-    "미래에셋증권": "006800",
-    "한국항공우주": "047810", "KAI": "047810",
-    "엔씨소프트": "036570", "엔씨": "036570",
-    "넷마블": "251270",
-    "펄어비스": "263750",
-    "카카오게임즈": "293490",
-    "위메이드": "112040",
-    "SKC": "011790",
-    "SK아이이테크놀로지": "361610", "SKIET": "361610",
-    "LG디스플레이": "034220", "LGD": "034220",
-    "삼성엔지니어링": "028050",
-    "GS건설": "006360",
-    "현대제철": "004020",
-    "롯데케미칼": "011170",
-    "S-Oil": "010950", "에스오일": "010950",
-    "한화": "000880",
-    "CJ": "001040",
-    "GS": "078930",
-    "LS": "006260",
-    "OCI": "010060",
-    "효성": "004800",
-    "LS일렉트릭": "010120",
-    "두산": "000150",
-    "현대글로비스": "086280",
-    "이마트": "139480",
-    "하이브": "352820", "HYBE": "352820",
-    "JYP엔터": "035900", "JYP": "035900",
-    "SM": "041510", "에스엠": "041510",
-    "유한양행": "000100",
-    "한미약품": "128940",
-    "종근당": "185750",
-    "대웅제약": "069620",
-    "SK바이오사이언스": "302440",
-    "엘앤에프": "066970", "L&F": "066970",
-    "천보": "278280",
-    "리노공업": "058470",
-    "HPSP": "403870",
-    "이오테크닉스": "039030",
-    "주성엔지니어링": "036930",
-    "원익IPS": "240810",
-    "피에스케이": "319660",
-}
 STOCK_CODE_PATTERN = re.compile(r'\b(\d{6})\b')
 
+class StockUniverse:
+    """
+    Downloads and parses KIS master files (kospi + kosdaq) to build
+    a complete name->code mapping for ALL listed Korean stocks.
+    Refreshes every 24 hours.
+    """
+    def __init__(self):
+        self.name_to_code = {}   # {"\uc0bc\uc131\uc804\uc790": "005930", ...}
+        self.code_to_name = {}   # {"005930": "\uc0bc\uc131\uc804\uc790", ...}
+        self.all_codes = set()
+        self.last_refresh = 0
+        self.refresh_interval = 86400  # 24 hours
+
+    async def load(self, session=None):
+        """Download and parse KIS master files."""
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession()
+            close_session = True
+
+        try:
+            name_to_code = {}
+            code_to_name = {}
+
+            for url, market in [
+                (KIS_KOSPI_MST_URL, "KOSPI"),
+                (KIS_KOSDAQ_MST_URL, "KOSDAQ"),
+            ]:
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status != 200:
+                            print(f"\u26a0\ufe0f Failed to download {market} master: HTTP {resp.status}")
+                            continue
+                        data = await resp.read()
+
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        for filename in zf.namelist():
+                            raw = zf.read(filename)
+                            # KIS MST files use cp949 encoding
+                            try:
+                                text = raw.decode("cp949", errors="ignore")
+                            except Exception:
+                                text = raw.decode("utf-8", errors="ignore")
+
+                            lines = text.strip().split("\n")
+                            for line in lines:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                # MST format: first 9 chars = short code (padded),
+                                # but actual format varies. Parse by extracting 6-digit code
+                                # and Korean name from the line.
+                                # Common format: code(9) + name(40) + ...
+                                try:
+                                    # Extract 6-digit code (skip leading spaces/zeros padding)
+                                    code_part = line[:9].strip()
+                                    # Find the 6-digit numeric code
+                                    code_match = re.search(r'(\d{6})', code_part)
+                                    if not code_match:
+                                        continue
+                                    code = code_match.group(1)
+
+                                    # Extract Korean name (next ~40 chars after code section)
+                                    name_part = line[9:49].strip()
+                                    if not name_part:
+                                        continue
+
+                                    # Clean name: remove trailing spaces, special markers
+                                    name = name_part.strip()
+                                    if not name:
+                                        continue
+
+                                    name_to_code[name] = code
+                                    code_to_name[code] = name
+                                except Exception:
+                                    continue
+
+                    print(f"\u2705 {market} master loaded: {len([c for c in code_to_name if code_to_name[c]])} stocks")
+
+                except Exception as e:
+                    print(f"\u274c Error loading {market} master: {e}")
+
+            if name_to_code:
+                self.name_to_code = name_to_code
+                self.code_to_name = code_to_name
+                self.all_codes = set(code_to_name.keys())
+                self.last_refresh = time.time()
+                print(f"\U0001f4ca Stock universe: {len(self.name_to_code)} names, {len(self.all_codes)} codes")
+            else:
+                print("\u26a0\ufe0f Stock universe empty - master files may have changed format")
+
+        finally:
+            if close_session:
+                await session.close()
+
+    async def ensure_fresh(self, session=None):
+        """Refresh if stale (older than 24 hours)."""
+        if time.time() - self.last_refresh > self.refresh_interval:
+            print("\U0001f504 Refreshing stock universe...")
+            await self.load(session)
+
+    def lookup_code(self, name):
+        """Look up stock code by exact name."""
+        return self.name_to_code.get(name)
+
+    def lookup_name(self, code):
+        """Look up stock name by code."""
+        return self.code_to_name.get(code)
+
+    def find_stocks_in_text(self, text):
+        """
+        Find all stock codes mentioned in text.
+        Checks both direct 6-digit codes and stock names.
+        Returns: list of stock codes
+        """
+        if not text:
+            return []
+        found = set()
+
+        # 1) Direct 6-digit code matches
+        for m in STOCK_CODE_PATTERN.finditer(text):
+            code = m.group()
+            if code != "000000" and code in self.all_codes:
+                found.add(code)
+
+        # 2) Stock name matches (longest match first to avoid partial matches)
+        sorted_names = sorted(self.name_to_code.keys(), key=len, reverse=True)
+        text_upper = text.upper()
+        for name in sorted_names:
+            if len(name) < 2:
+                continue  # Skip very short names to avoid false positives
+            if name in text or name.upper() in text_upper:
+                code = self.name_to_code[name]
+                if code:
+                    found.add(code)
+
+        return list(found)
+
+
+# Global stock universe instance
+stock_universe = StockUniverse()
+
+
 # ============================================================
-# 한국투자증권 API
+# OCR: Extract text from images
+# ============================================================
+async def extract_text_from_image(client, message):
+    """
+    Download image from Telegram message and run OCR.
+    Returns extracted text or empty string.
+    """
+    if not OCR_AVAILABLE:
+        return ""
+    if not message.media:
+        return ""
+
+    try:
+        # Download the image to memory
+        image_bytes = await client.download_media(message, bytes)
+        if not image_bytes:
+            return ""
+
+        # Open with PIL
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Run Tesseract OCR with Korean + English
+        text = pytesseract.image_to_string(img, lang="kor+eng")
+        text = text.strip()
+
+        if text:
+            print(f"\U0001f50d OCR extracted {len(text)} chars from image")
+        return text
+
+    except Exception as e:
+        print(f"\u26a0\ufe0f OCR error: {e}")
+        return ""
+
+
+# ============================================================
+# \ud55c\uad6d\ud22c\uc790\uc99d\uad8c API
 # ============================================================
 class KISApi:
     def __init__(self):
@@ -240,17 +348,17 @@ class KISApi:
             if "access_token" in data:
                 self.access_token = data["access_token"]
                 self.token_expires = now + 85000
-                print(f"\U0001f511 KIS 토큰 발급 성공")
+                print(f"\U0001f511 KIS \ud1a0\ud070 \ubc1c\uae09 \uc131\uacf5")
                 return self.access_token
             else:
-                print(f"\u274c KIS 토큰 실패: {data}")
+                print(f"\u274c KIS \ud1a0\ud070 \uc2e4\ud328: {data}")
                 return None
         except Exception as e:
-            print(f"\u274c KIS 토큰 에러: {e}")
+            print(f"\u274c KIS \ud1a0\ud070 \uc5d0\ub7ec: {e}")
             return None
 
     async def get_stock_price(self, stock_code):
-        """현재가 조회"""
+        """\ud604\uc7ac\uac00 \uc870\ud68c"""
         token = await self.get_token()
         if not token:
             return None
@@ -289,22 +397,17 @@ class KISApi:
                     "w52_lwpr": int(out.get("w52_lwpr", "0")),
                 }
             else:
-                print(f"\u26a0\ufe0f 시세실패 [{stock_code}]: {data.get('msg1', '')}")
+                print(f"\u26a0\ufe0f \uc2dc\uc138\uc2e4\ud328 [{stock_code}]: {data.get('msg1', '')}")
                 return None
         except asyncio.TimeoutError:
-            print(f"\u26a0\ufe0f 시세 타임아웃 [{stock_code}]")
+            print(f"\u26a0\ufe0f \uc2dc\uc138 \ud0c0\uc784\uc544\uc6c3 [{stock_code}]")
             return None
         except Exception as e:
-            print(f"\u274c 시세에러 [{stock_code}]: {e}")
+            print(f"\u274c \uc2dc\uc138\uc5d0\ub7ec [{stock_code}]: {e}")
             return None
 
     async def get_rolling_volume(self, stock_code, minutes=20):
-        """
-        최근 N분 rolling 거래대금 조회.
-        주식당일분봉조회 (FHKST03010200) API를 사용하여
-        1분봉 데이터의 체결량 x 체결가 합산.
-        Returns: 거래대금 (won), 0 on error
-        """
+        """\ucd5c\uadfc N\ubd84 rolling \uac70\ub798\ub300\uae08 \uc870\ud68c."""
         token = await self.get_token()
         if not token:
             return 0
@@ -341,21 +444,17 @@ class KISApi:
                     count += 1
                 return total
             else:
-                print(f"\u26a0\ufe0f 분봉실패 [{stock_code}]: {data.get('msg1', '')}")
+                print(f"\u26a0\ufe0f \ubd84\ubd09\uc2e4\ud328 [{stock_code}]: {data.get('msg1', '')}")
                 return 0
         except asyncio.TimeoutError:
-            print(f"\u26a0\ufe0f 분봉 타임아웃 [{stock_code}]")
+            print(f"\u26a0\ufe0f \ubd84\ubd09 \ud0c0\uc784\uc544\uc6c3 [{stock_code}]")
             return 0
         except Exception as e:
-            print(f"\u274c 분봉에러 [{stock_code}]: {e}")
+            print(f"\u274c \ubd84\ubd09\uc5d0\ub7ec [{stock_code}]: {e}")
             return 0
 
     async def get_daily_prices(self, stock_code, count=60):
-        """
-        일별 종가 조회 (최근 count일).
-        주식당일봉조회 (FHKST03010100) API 사용.
-        Returns: list of closing prices (newest first), empty list on error
-        """
+        """\uc77c\ubcc4 \uc885\uac00 \uc870\ud68c (\ucd5c\uadfc count\uc77c)."""
         token = await self.get_token()
         if not token:
             return []
@@ -390,13 +489,13 @@ class KISApi:
                         closes.append(close)
                 return closes
             else:
-                print(f"\u26a0\ufe0f 일봉실패 [{stock_code}]: {data.get('msg1', '')}")
+                print(f"\u26a0\ufe0f \uc77c\ubd09\uc2e4\ud328 [{stock_code}]: {data.get('msg1', '')}")
                 return []
         except asyncio.TimeoutError:
-            print(f"\u26a0\ufe0f 일봉 타임아웃 [{stock_code}]")
+            print(f"\u26a0\ufe0f \uc77c\ubd09 \ud0c0\uc784\uc544\uc6c3 [{stock_code}]")
             return []
         except Exception as e:
-            print(f"\u274c 일봉에러 [{stock_code}]: {e}")
+            print(f"\u274c \uc77c\ubd09\uc5d0\ub7ec [{stock_code}]: {e}")
             return []
 
     async def close(self):
@@ -408,45 +507,23 @@ class KISApi:
 # RISK LEVEL & MOVING AVERAGE HELPERS
 # ============================================================
 def compute_risk_level(price_info):
-    """
-    RISK 판정: 등락률 + 52주 고저 위치 기반
-    Returns: (risk_label, risk_emoji)
-    """
     try:
         change_rate = abs(float(price_info.get("change_rate", "0")))
         price = price_info.get("price", 0)
         w52_high = price_info.get("w52_hgpr", 0)
         w52_low = price_info.get("w52_lwpr", 0)
-
-        # 52주 범위 내 위치 (0~100%)
         if w52_high > w52_low and w52_high > 0:
             position = (price - w52_low) / (w52_high - w52_low) * 100
         else:
             position = 50
-
-        # RISK scoring
         risk_score = 0
-
-        # 등락률 기반
-        if change_rate >= 10:
-            risk_score += 3
-        elif change_rate >= 5:
-            risk_score += 2
-        elif change_rate >= 3:
-            risk_score += 1
-
-        # 52주 고점 근접 (과열)
-        if position >= 90:
-            risk_score += 2
-        elif position >= 75:
-            risk_score += 1
-
-        # 52주 저점 근접 (낙폭과대)
-        if position <= 10:
-            risk_score += 2
-        elif position <= 25:
-            risk_score += 1
-
+        if change_rate >= 10: risk_score += 3
+        elif change_rate >= 5: risk_score += 2
+        elif change_rate >= 3: risk_score += 1
+        if position >= 90: risk_score += 2
+        elif position >= 75: risk_score += 1
+        if position <= 10: risk_score += 2
+        elif position <= 25: risk_score += 1
         if risk_score >= 4:
             return "\U0001f534 HIGH", "\U0001f534"
         elif risk_score >= 2:
@@ -458,106 +535,68 @@ def compute_risk_level(price_info):
 
 
 def compute_ma_state(closes, current_price=None):
-    """
-    이동평균선 상태 판정 (5일/20일/60일 기준)
-    closes: list of daily closing prices (newest first)
-    Returns: (state_text, emoji)
-    """
     try:
         if len(closes) < 5:
-            return "데이터 부족", "\u2753"
-
+            return "\ub370\uc774\ud130 \ubd80\uc871", "\u2753"
         ma5 = sum(closes[:5]) / 5
         ma20 = sum(closes[:20]) / 20 if len(closes) >= 20 else None
         ma60 = sum(closes[:60]) / 60 if len(closes) >= 60 else None
-
         price = current_price if current_price else closes[0]
-
         parts = []
         signals = {"bullish": 0, "bearish": 0}
-
-        # 현재가 vs MA5
         if price > ma5:
-            parts.append(f"5일선({ma5:,.0f}) 위")
+            parts.append(f"5\uc77c\uc120({ma5:,.0f}) \uc704")
             signals["bullish"] += 1
         else:
-            parts.append(f"5일선({ma5:,.0f}) 아래")
+            parts.append(f"5\uc77c\uc120({ma5:,.0f}) \uc544\ub798")
             signals["bearish"] += 1
-
-        # 현재가 vs MA20
         if ma20:
             if price > ma20:
-                parts.append(f"20일선({ma20:,.0f}) 위")
+                parts.append(f"20\uc77c\uc120({ma20:,.0f}) \uc704")
                 signals["bullish"] += 1
             else:
-                parts.append(f"20일선({ma20:,.0f}) 아래")
+                parts.append(f"20\uc77c\uc120({ma20:,.0f}) \uc544\ub798")
                 signals["bearish"] += 1
-
-        # 현재가 vs MA60
         if ma60:
             if price > ma60:
-                parts.append(f"60일선({ma60:,.0f}) 위")
+                parts.append(f"60\uc77c\uc120({ma60:,.0f}) \uc704")
                 signals["bullish"] += 1
             else:
-                parts.append(f"60일선({ma60:,.0f}) 아래")
+                parts.append(f"60\uc77c\uc120({ma60:,.0f}) \uc544\ub798")
                 signals["bearish"] += 1
-
-        # 골든크로스 / 데드크로스
         cross = ""
         if ma20 and len(closes) >= 21:
             prev_ma5 = sum(closes[1:6]) / 5
             prev_ma20 = sum(closes[1:21]) / 20
             if prev_ma5 <= prev_ma20 and ma5 > ma20:
-                cross = "\U0001f31f 골든크로스(5/20)"
+                cross = "\U0001f31f \uace8\ub4e0\ud06c\ub85c\uc2a4(5/20)"
                 signals["bullish"] += 2
             elif prev_ma5 >= prev_ma20 and ma5 < ma20:
-                cross = "\U0001f480 데드크로스(5/20)"
+                cross = "\U0001f480 \ub370\ub4dc\ud06c\ub85c\uc2a4(5/20)"
                 signals["bearish"] += 2
-
-        # 종합 판정
         total_bull = signals["bullish"]
         total_bear = signals["bearish"]
-
         if total_bull >= 4:
-            state = "\U0001f7e2 강세 (Strong Bullish)"
+            state = "\U0001f7e2 \uac15\uc138 (Strong Bullish)"
         elif total_bull > total_bear:
-            state = "\U0001f7e2 상승추세 (Bullish)"
+            state = "\U0001f7e2 \uc0c1\uc2b9\ucd94\uc138 (Bullish)"
         elif total_bear >= 4:
-            state = "\U0001f534 약세 (Strong Bearish)"
+            state = "\U0001f534 \uc57d\uc138 (Strong Bearish)"
         elif total_bear > total_bull:
-            state = "\U0001f534 하락추세 (Bearish)"
+            state = "\U0001f534 \ud558\ub77d\ucd94\uc138 (Bearish)"
         else:
-            state = "\U0001f7e1 횡보 (Neutral)"
-
+            state = "\U0001f7e1 \ud6a1\ubcf4 (Neutral)"
         ma_detail = " | ".join(parts)
         if cross:
             ma_detail += f" | {cross}"
-
         return state, ma_detail
     except Exception:
-        return "\u2753 계산 불가", ""
+        return "\u2753 \uacc4\uc0b0 \ubd88\uac00", ""
 
 
 # ============================================================
-# 종목 추출
+# HELPER FUNCTIONS
 # ============================================================
-def extract_stock_codes(text):
-    if not text:
-        return []
-    found = set()
-    for m in STOCK_CODE_PATTERN.finditer(text):
-        code = m.group()
-        if code != "000000":
-            found.add(code)
-    sorted_names = sorted(STOCK_MAP.keys(), key=len, reverse=True)
-    for name in sorted_names:
-        if name in text or name.upper() in text.upper():
-            code = STOCK_MAP[name]
-            if code and code != "None":
-                found.add(code)
-    return list(found)
-
-
 def contains_crypto_keyword(text):
     if not text:
         return False
@@ -673,10 +712,10 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 # ============================================================
 async def main():
     print("=" * 50)
-    print("  Telegram Monitor v7.0")
+    print("  Telegram Monitor v7.1")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
-    print("  BOT2: 실적/공시 -> @jason_earnings")
-    print("  BOT3: 종목별 시세/거래대금/RISK/MA 알림 -> @alerts_forme")
+    print("  BOT2: \uc2e4\uc801/\uacf5\uc2dc -> @jason_earnings")
+    print("  BOT3: \uc885\ubaa9\ubcc4 \uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA + OCR -> @alerts_forme")
     print("=" * 50)
 
     if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
@@ -697,6 +736,12 @@ async def main():
     kis = KISApi() if kis_ok else None
     detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
     cooldown = AlertCooldown(cooldown_minutes=30)
+
+    # Load stock universe from KIS master files
+    print("\U0001f4e5 Loading stock universe from KIS master files...")
+    await stock_universe.load()
+    if not stock_universe.all_codes:
+        print("\u26a0\ufe0f Stock universe empty - falling back without name matching")
 
     client = TelegramClient(
         StringSession(SESSION_STRING),
@@ -758,9 +803,11 @@ async def main():
     print(f"\U0001f4ca Monitoring {len(monitored_ids)} chats")
     print(f"\U0001f4ec All unique (no crypto) -> {TARGET_CHANNEL}")
     if EARNINGS_CHANNEL:
-        print(f"\U0001f4c8 실적/공시 -> {EARNINGS_CHANNEL}")
+        print(f"\U0001f4c8 \uc2e4\uc801/\uacf5\uc2dc -> {EARNINGS_CHANNEL}")
     if kis:
-        print(f"\U0001f6a8 종목 알림 (시세/거래대금/RISK/MA) -> {VOLUME_ALERT_CHANNEL}")
+        print(f"\U0001f6a8 \uc885\ubaa9 \uc54c\ub9bc (\uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA) -> {VOLUME_ALERT_CHANNEL}")
+    if OCR_AVAILABLE:
+        print("\U0001f50d OCR enabled: image stock detection active")
 
     bg_tasks = []
 
@@ -783,6 +830,8 @@ async def main():
                 print("\U0001f504 Refreshing dialog list...")
                 added = await refresh_dialogs()
                 print(f"  \u2705 {added} new, total: {len(monitored_ids)}")
+                # Also refresh stock universe if stale
+                await stock_universe.ensure_fresh()
         except asyncio.CancelledError:
             pass
 
@@ -807,75 +856,92 @@ async def main():
                     return
 
             chat_name = getattr(chat, "title", "Unknown")
-            msg = event.message.text
+            msg = event.message.text or ""
             has_media = event.message.media is not None
             is_media_only = not msg and has_media
 
-            # ====== BOT 1: Media-only ======
-            if is_media_only:
+            # ====== OCR: Extract text from images for stock detection ======
+            ocr_text = ""
+            if has_media and OCR_AVAILABLE and kis:
+                ocr_text = await extract_text_from_image(client, event.message)
+
+            # Combined text for stock detection (message text + OCR text)
+            combined_text = msg
+            if ocr_text:
+                combined_text = f"{msg}\n{ocr_text}" if msg else ocr_text
+
+            # ====== BOT 1: Media-only (no text, no OCR stocks) ======
+            if is_media_only and not ocr_text:
                 try:
                     await safe_forward(client, TARGET_CHANNEL, event.message)
                 except Exception:
                     try:
                         icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
                         await safe_send(client, TARGET_CHANNEL,
-                            f"\U0001f4ce {icon}**{chat_name}** [미디어 메시지]",
+                            f"\U0001f4ce {icon}**{chat_name}** [\ubbf8\ub514\uc5b4 \uba54\uc2dc\uc9c0]",
                             link_preview=False)
                     except Exception:
                         pass
-                return
+                # Still check for stocks via OCR below if ocr_text exists
+                if not ocr_text:
+                    return
 
             # ====== BOT 1: Text - filter crypto, dedup ======
-            if contains_crypto_keyword(msg):
-                return
-            if detector.is_duplicate(msg):
-                return
+            if msg:
+                if contains_crypto_keyword(msg):
+                    return
+                if detector.is_duplicate(msg):
+                    return
 
-            print(f"\U0001f4e8 [{chat_name}] Unique msg ({len(msg)} chars)")
+                print(f"\U0001f4e8 [{chat_name}] Unique msg ({len(msg)} chars)")
 
-            forwarded = False
-            try:
-                await safe_forward(client, TARGET_CHANNEL, event.message)
-                forwarded = True
-                print(f"  \u2705 Forwarded to {TARGET_CHANNEL}")
-            except Exception:
+                forwarded = False
                 try:
-                    icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
-                    await safe_send(client, TARGET_CHANNEL,
-                        f"{icon}**{chat_name}**\n{msg}",
-                        link_preview=False)
+                    await safe_forward(client, TARGET_CHANNEL, event.message)
                     forwarded = True
+                    print(f"  \u2705 Forwarded to {TARGET_CHANNEL}")
                 except Exception:
-                    pass
-            if not forwarded:
-                print(f"  \u274c FAILED to deliver to {TARGET_CHANNEL}!")
+                    try:
+                        icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
+                        await safe_send(client, TARGET_CHANNEL,
+                            f"{icon}**{chat_name}**\n{msg}",
+                            link_preview=False)
+                        forwarded = True
+                    except Exception:
+                        pass
+                if not forwarded:
+                    print(f"  \u274c FAILED to deliver to {TARGET_CHANNEL}!")
 
-            # ====== BOT 2: 실적/공시 ======
-            if EARNINGS_CHANNEL and contains_earnings_keyword(msg):
+            # ====== BOT 2: \uc2e4\uc801/\uacf5\uc2dc ======
+            if EARNINGS_CHANNEL and msg and contains_earnings_keyword(msg):
                 matched = [kw for kw in EARNINGS_KEYWORDS if kw.lower() in msg.lower()][:5]
-                print(f"  \U0001f4c8 실적/공시: {matched}")
+                print(f"  \U0001f4c8 \uc2e4\uc801/\uacf5\uc2dc: {matched}")
                 try:
                     await safe_forward(client, EARNINGS_CHANNEL, event.message)
                     print(f"  \u2705 -> {EARNINGS_CHANNEL}")
                 except Exception:
                     try:
                         await safe_send(client, EARNINGS_CHANNEL,
-                            f"\U0001f4c8 **[실적/공시]** {chat_name}\n"
+                            f"\U0001f4c8 **[\uc2e4\uc801/\uacf5\uc2dc]** {chat_name}\n"
                             f"\U0001f511 {', '.join(matched)}\n"
                             f"{msg[:500]}",
                             link_preview=False)
                     except Exception:
                         pass
 
-            # ====== BOT 3: 종목별 시세/거래대금/RISK/MA 알림 ======
-            # Now runs independently - triggers on ANY stock mention
-            if kis and msg:
-                codes = extract_stock_codes(msg)
+            # ====== BOT 3: \uc885\ubaa9\ubcc4 \uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA \uc54c\ub9bc ======
+            # Uses combined_text (msg + OCR) for stock detection
+            if kis and combined_text:
+                codes = stock_universe.find_stocks_in_text(combined_text)
+
+                if ocr_text and codes:
+                    print(f"  \U0001f50d OCR detected stocks: {codes}")
+
                 for code in codes:
                     if not cooldown.can_alert(code):
                         continue
 
-                    # 1) 현재가 조회
+                    # 1) \ud604\uc7ac\uac00 \uc870\ud68c
                     price_info = await kis.get_stock_price(code)
                     if not price_info:
                         cooldown.reset(code)
@@ -883,19 +949,19 @@ async def main():
 
                     name = price_info.get("name", code)
 
-                    # 2) 20분 rolling 거래대금 조회
+                    # 2) 20\ubd84 rolling \uac70\ub798\ub300\uae08
                     rolling_vol = await kis.get_rolling_volume(code, minutes=20)
 
-                    # 3) 일별 종가 조회 (MA 계산용)
+                    # 3) \uc77c\ubcc4 \uc885\uac00 (MA \uacc4\uc0b0\uc6a9)
                     daily_closes = await kis.get_daily_prices(code, count=60)
 
-                    # 4) RISK 판정
+                    # 4) RISK \ud310\uc815
                     risk_label, risk_emoji = compute_risk_level(price_info)
 
-                    # 5) 이동평균 상태
+                    # 5) \uc774\ub3d9\ud3c9\uade0 \uc0c1\ud0dc
                     ma_state, ma_detail = compute_ma_state(daily_closes, price_info["price"])
 
-                    # 6) 등락 방향 이모지
+                    # 6) \ub4f1\ub77d \ubc29\ud5a5
                     change_val = float(price_info.get("change_rate", "0"))
                     if change_val > 0:
                         direction = "\U0001f53a"
@@ -904,36 +970,36 @@ async def main():
                     else:
                         direction = "\u25ab"
 
-                    print(f"  \U0001f4b0 [{code}] {name} 현재가: {price_info['price']:,}원 "
-                          f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억")
+                    source_type = "[OCR]" if (ocr_text and not msg) else ""
+                    print(f"  \U0001f4b0 {source_type}[{code}] {name} {price_info['price']:,}\uc6d0 "
+                          f"({change_val:+.2f}%) 20\ubd84\uac70\ub798\ub300\uae08: {rolling_vol/100_000_000:.2f}\uc5b5")
 
-                    # 알림 메시지 구성
+                    # \uc54c\ub9bc \uba54\uc2dc\uc9c0 \uad6c\uc131
                     alert_lines = [
-                        f"\U0001f514 **종목 알림 ({name})**",
+                        f"\U0001f514 **\uc885\ubaa9 \uc54c\ub9bc ({name})**",
                         f"",
                         f"\U0001f4cc **{name}** ({code})",
-                        f"\U0001f4b0 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
-                        f"\U0001f4c8 시가: {price_info.get('open_price', 0):,} | 고가: {price_info.get('high_price', 0):,} | 저가: {price_info.get('low_price', 0):,}",
-                        f"\U0001f4ca 거래량: {price_info.get('acml_vol', 0):,}주",
-                        f"\U0001f4b5 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
-                        f"\U0001f4b5 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
+                        f"\U0001f4b0 \ud604\uc7ac\uac00: {price_info['price']:,}\uc6d0 {direction} {change_val:+.2f}%",
+                        f"\U0001f4c8 \uc2dc\uac00: {price_info.get('open_price', 0):,} | \uace0\uac00: {price_info.get('high_price', 0):,} | \uc800\uac00: {price_info.get('low_price', 0):,}",
+                        f"\U0001f4ca \uac70\ub798\ub7c9: {price_info.get('acml_vol', 0):,}\uc8fc",
+                        f"\U0001f4b5 \ub204\uc801\uac70\ub798\ub300\uae08: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}\uc5b5",
+                        f"\U0001f4b5 20\ubd84 \uac70\ub798\ub300\uae08: {rolling_vol/100_000_000:.1f}\uc5b5",
                         f"",
                         f"\u26a0\ufe0f RISK: {risk_label}",
-                        f"\U0001f4c9 이동평균: {ma_state}",
+                        f"\U0001f4c9 \uc774\ub3d9\ud3c9\uade0: {ma_state}",
                     ]
                     if ma_detail:
-                        alert_lines.append(f"  \U000027a1 {ma_detail}")
+                        alert_lines.append(f"  \u27a1 {ma_detail}")
 
-                    # 52주 고저
                     w52h = price_info.get("w52_hgpr", 0)
                     w52l = price_info.get("w52_lwpr", 0)
                     if w52h and w52l:
                         pos_pct = ((price_info["price"] - w52l) / (w52h - w52l) * 100) if w52h > w52l else 0
-                        alert_lines.append(f"\U0001f4cd 52주: {w52l:,} ~ {w52h:,} (현재 {pos_pct:.0f}% 위치)")
+                        alert_lines.append(f"\U0001f4cd 52\uc8fc: {w52l:,} ~ {w52h:,} (\ud604\uc7ac {pos_pct:.0f}% \uc704\uce58)")
 
                     alert_lines.extend([
                         f"",
-                        f"\U0001f4ac 출처: {chat_name}",
+                        f"\U0001f4ac \ucd9c\ucc98: {chat_name}" + (f" \U0001f50d(OCR)" if ocr_text and code not in (stock_universe.find_stocks_in_text(msg) if msg else []) else ""),
                         f"\u23f0 {datetime.now().strftime('%H:%M:%S')}",
                     ])
 
@@ -955,7 +1021,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.0)")
+    print(f"\U0001f3a7 Listening... (v7.1)")
 
     try:
         await client.run_until_disconnected()
