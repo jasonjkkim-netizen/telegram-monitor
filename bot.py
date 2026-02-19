@@ -1,15 +1,23 @@
 """
-Telegram Channel & Group Monitor v6.1
+Telegram Channel & Group Monitor v7.0
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
-BOT 3: 종목 언급 + 20분 거래대금 >= 10억 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v7.0 Changes:
+    - Redesigned BOT 3: now alerts on EVERY stock mention (not just volume threshold)
+    - BOT 3 now shows: price, change rate, aggregated volume,
+      RISK level (based on price change %), and moving average state
+    - Added get_daily_close_prices() for MA calculation (5/20/60 day)
+    - Added compute_risk_level() for RISK indicator
+    - Added compute_ma_state() for moving average crossover state
+    - BOT 3 runs independently from BOT 2 (not nested inside earnings block)
 
 v6.1 Changes:
     - Changed BOT 3 volume check from cumulative daily (acml_tr_pbmn) to
       rolling 20-minute window using minute-candle API (FHKST03010200)
     - Added get_rolling_volume() method: sums vol*price from last 20 one-minute candles
-    - Alert message now shows "20분 거래대금" instead of "누적거래대금"
 
 v6.0 Fixes:
     - Fixed aiohttp session: removed base_url, using full URLs
@@ -27,6 +35,7 @@ import time
 import aiohttp
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
+
 from telethon import TelegramClient, events, utils, errors
 from telethon.sessions import StringSession
 from telethon.types import Channel, Chat
@@ -35,23 +44,23 @@ from telethon.types import Channel, Chat
 # CONFIGURATION
 # ============================================================
 API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "")          # @my_filtered_news
-EARNINGS_CHANNEL = os.environ.get("EARNINGS_CHANNEL", "")      # @jason_earnings
-VOLUME_ALERT_CHANNEL = os.environ.get("VOLUME_ALERT_CHANNEL", "")  # @alerts_forme
+API_HASH = os.environ.get("API_HASH")
+SESSION_STRING = os.environ.get("SESSION_STRING")
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL")       # @my_filtered_news
+EARNINGS_CHANNEL = os.environ.get("EARNINGS_CHANNEL")   # @jason_earnings
+VOLUME_ALERT_CHANNEL = os.environ.get("VOLUME_ALERT_CHANNEL")  # @alerts_forme
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 
 # 한국투자증권 API
-KIS_APP_KEY = os.environ.get("KIS_APP_KEY", "")
-KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
-KIS_ACCOUNT_NO = os.environ.get("KIS_ACCOUNT_NO", "")
+KIS_APP_KEY = os.environ.get("KIS_APP_KEY")
+KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET")
+KIS_ACCOUNT_NO = os.environ.get("KIS_ACCOUNT_NO")
 KIS_ACCOUNT_PROD = os.environ.get("KIS_ACCOUNT_PROD", "01")
 
 # 거래대금 기준: 20분 rolling 10억원 (1,000,000,000 KRW)
 VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "1000000000"))
-
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+
 # ============================================================
 # CRYPTO FILTER KEYWORDS (BOT 1)
 # ============================================================
@@ -94,6 +103,7 @@ EARNINGS_KEYWORDS = [
     "공시", "공시내용", "수시공시", "주요공시",
     "판매량", "판매실적", "수주", "수주잔고", "수주액",
 ]
+
 # ============================================================
 # 종목명 -> 종목코드 매핑
 # ============================================================
@@ -146,9 +156,9 @@ STOCK_MAP = {
     "금양": "001570",
     "HLB": "028300",
     "알테오젠": "196170",
-    "리가케바이오": "141080",
-    "SK바이오팸": "326030",
-    "두산밥캿": "241560",
+    "리가케미바이오": "141080",
+    "SK바이오팜": "326030",
+    "두산밥캣": "241560",
     "CJ제일제당": "097950",
     "아모레퍼시픽": "090430",
     "한화솔루션": "009830",
@@ -188,7 +198,7 @@ STOCK_MAP = {
     "종근당": "185750",
     "대웅제약": "069620",
     "SK바이오사이언스": "302440",
-    "엘앙에프": "066970", "L&F": "066970",
+    "엘앤에프": "066970", "L&F": "066970",
     "천보": "278280",
     "리노공업": "058470",
     "HPSP": "403870",
@@ -197,8 +207,8 @@ STOCK_MAP = {
     "원익IPS": "240810",
     "피에스케이": "319660",
 }
-
 STOCK_CODE_PATTERN = re.compile(r'\b(\d{6})\b')
+
 # ============================================================
 # 한국투자증권 API
 # ============================================================
@@ -210,14 +220,13 @@ class KISApi:
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
     async def get_token(self):
         now = time.time()
         if self.access_token and now < self.token_expires:
             return self.access_token
-
         await self.ensure_session()
         url = f"{KIS_BASE_URL}/oauth2/tokenP"
         body = {
@@ -228,16 +237,16 @@ class KISApi:
         try:
             async with self.session.post(url, json=body) as resp:
                 data = await resp.json()
-                if "access_token" in data:
-                    self.access_token = data["access_token"]
-                    self.token_expires = now + 85000
-                    print(f"🔑 KIS 토큰 발급 성공")
-                    return self.access_token
-                else:
-                    print(f"❌ KIS 토큰 실패: {data}")
-                    return None
+            if "access_token" in data:
+                self.access_token = data["access_token"]
+                self.token_expires = now + 85000
+                print(f"\U0001f511 KIS 토큰 발급 성공")
+                return self.access_token
+            else:
+                print(f"\u274c KIS 토큰 실패: {data}")
+                return None
         except Exception as e:
-            print(f"❌ KIS 토큰 에러: {e}")
+            print(f"\u274c KIS 토큰 에러: {e}")
             return None
 
     async def get_stock_price(self, stock_code):
@@ -245,7 +254,6 @@ class KISApi:
         token = await self.get_token()
         if not token:
             return None
-
         await self.ensure_session()
         url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
         headers = {
@@ -262,23 +270,32 @@ class KISApi:
         try:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 data = await resp.json()
-                if data.get("rt_cd") == "0":
-                    out = data.get("output", {})
-                    return {
-                        "name": out.get("hts_kor_isnm", stock_code),
-                        "price": int(out.get("stck_prpr", "0")),
-                        "change_rate": out.get("prdy_ctrt", "0"),
-                        "acml_tr_pbmn": int(out.get("acml_tr_pbmn", "0")),
-                        "acml_vol": int(out.get("acml_vol", "0")),
-                    }
-                else:
-                    print(f"⚠️ 시세실패 [{stock_code}]: {data.get('msg1','')}")
-                    return None
+            if data.get("rt_cd") == "0":
+                out = data.get("output", {})
+                return {
+                    "name": out.get("hts_kor_isnm", stock_code),
+                    "price": int(out.get("stck_prpr", "0")),
+                    "change_rate": out.get("prdy_ctrt", "0"),
+                    "change_sign": out.get("prdy_vrss_sign", "3"),
+                    "high_price": int(out.get("stck_hgpr", "0")),
+                    "low_price": int(out.get("stck_lwpr", "0")),
+                    "open_price": int(out.get("stck_oprc", "0")),
+                    "prev_close": int(out.get("stck_sdpr", "0")),
+                    "acml_tr_pbmn": int(out.get("acml_tr_pbmn", "0")),
+                    "acml_vol": int(out.get("acml_vol", "0")),
+                    "per": out.get("per", "N/A"),
+                    "pbr": out.get("pbr", "N/A"),
+                    "w52_hgpr": int(out.get("w52_hgpr", "0")),
+                    "w52_lwpr": int(out.get("w52_lwpr", "0")),
+                }
+            else:
+                print(f"\u26a0\ufe0f 시세실패 [{stock_code}]: {data.get('msg1', '')}")
+                return None
         except asyncio.TimeoutError:
-            print(f"⚠️ 시세 타임아웃 [{stock_code}]")
+            print(f"\u26a0\ufe0f 시세 타임아웃 [{stock_code}]")
             return None
         except Exception as e:
-            print(f"❌ 시세에러 [{stock_code}]: {e}")
+            print(f"\u274c 시세에러 [{stock_code}]: {e}")
             return None
 
     async def get_rolling_volume(self, stock_code, minutes=20):
@@ -291,7 +308,6 @@ class KISApi:
         token = await self.get_token()
         if not token:
             return 0
-
         await self.ensure_session()
         url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
         headers = {
@@ -312,31 +328,216 @@ class KISApi:
         try:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 data = await resp.json()
-                if data.get("rt_cd") == "0":
-                    items = data.get("output2", [])
-                    total = 0
-                    count = 0
-                    for item in items:
-                        if count >= minutes:
-                            break
-                        vol = int(item.get("cntg_vol", "0"))
-                        price = int(item.get("stck_prpr", "0"))
-                        total += vol * price
-                        count += 1
-                    return total
-                else:
-                    print(f"⚠️ 분봉실패 [{stock_code}]: {data.get('msg1','')}")
-                    return 0
+            if data.get("rt_cd") == "0":
+                items = data.get("output2", [])
+                total = 0
+                count = 0
+                for item in items:
+                    if count >= minutes:
+                        break
+                    vol = int(item.get("cntg_vol", "0"))
+                    price = int(item.get("stck_prpr", "0"))
+                    total += vol * price
+                    count += 1
+                return total
+            else:
+                print(f"\u26a0\ufe0f 분봉실패 [{stock_code}]: {data.get('msg1', '')}")
+                return 0
         except asyncio.TimeoutError:
-            print(f"⚠️ 분봉 타임아웃 [{stock_code}]")
+            print(f"\u26a0\ufe0f 분봉 타임아웃 [{stock_code}]")
             return 0
         except Exception as e:
-            print(f"❌ 분봉에러 [{stock_code}]: {e}")
+            print(f"\u274c 분봉에러 [{stock_code}]: {e}")
             return 0
+
+    async def get_daily_prices(self, stock_code, count=60):
+        """
+        일별 종가 조회 (최근 count일).
+        주식당일봉조회 (FHKST03010100) API 사용.
+        Returns: list of closing prices (newest first), empty list on error
+        """
+        token = await self.get_token()
+        if not token:
+            return []
+        await self.ensure_session()
+        url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        headers = {
+            "authorization": f"Bearer {token}",
+            "appkey": KIS_APP_KEY,
+            "appsecret": KIS_APP_SECRET,
+            "tr_id": "FHKST03010100",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        today = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start_date,
+            "FID_INPUT_DATE_2": today,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0",
+        }
+        try:
+            async with self.session.get(url, headers=headers, params=params) as resp:
+                data = await resp.json()
+            if data.get("rt_cd") == "0":
+                items = data.get("output2", [])
+                closes = []
+                for item in items[:count]:
+                    close = int(item.get("stck_clpr", "0"))
+                    if close > 0:
+                        closes.append(close)
+                return closes
+            else:
+                print(f"\u26a0\ufe0f 일봉실패 [{stock_code}]: {data.get('msg1', '')}")
+                return []
+        except asyncio.TimeoutError:
+            print(f"\u26a0\ufe0f 일봉 타임아웃 [{stock_code}]")
+            return []
+        except Exception as e:
+            print(f"\u274c 일봉에러 [{stock_code}]: {e}")
+            return []
 
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
+
+
+# ============================================================
+# RISK LEVEL & MOVING AVERAGE HELPERS
+# ============================================================
+def compute_risk_level(price_info):
+    """
+    RISK 판정: 등락률 + 52주 고저 위치 기반
+    Returns: (risk_label, risk_emoji)
+    """
+    try:
+        change_rate = abs(float(price_info.get("change_rate", "0")))
+        price = price_info.get("price", 0)
+        w52_high = price_info.get("w52_hgpr", 0)
+        w52_low = price_info.get("w52_lwpr", 0)
+
+        # 52주 범위 내 위치 (0~100%)
+        if w52_high > w52_low and w52_high > 0:
+            position = (price - w52_low) / (w52_high - w52_low) * 100
+        else:
+            position = 50
+
+        # RISK scoring
+        risk_score = 0
+
+        # 등락률 기반
+        if change_rate >= 10:
+            risk_score += 3
+        elif change_rate >= 5:
+            risk_score += 2
+        elif change_rate >= 3:
+            risk_score += 1
+
+        # 52주 고점 근접 (과열)
+        if position >= 90:
+            risk_score += 2
+        elif position >= 75:
+            risk_score += 1
+
+        # 52주 저점 근접 (낙폭과대)
+        if position <= 10:
+            risk_score += 2
+        elif position <= 25:
+            risk_score += 1
+
+        if risk_score >= 4:
+            return "\U0001f534 HIGH", "\U0001f534"
+        elif risk_score >= 2:
+            return "\U0001f7e1 MEDIUM", "\U0001f7e1"
+        else:
+            return "\U0001f7e2 LOW", "\U0001f7e2"
+    except Exception:
+        return "\u2753 N/A", "\u2753"
+
+
+def compute_ma_state(closes, current_price=None):
+    """
+    이동평균선 상태 판정 (5일/20일/60일 기준)
+    closes: list of daily closing prices (newest first)
+    Returns: (state_text, emoji)
+    """
+    try:
+        if len(closes) < 5:
+            return "데이터 부족", "\u2753"
+
+        ma5 = sum(closes[:5]) / 5
+        ma20 = sum(closes[:20]) / 20 if len(closes) >= 20 else None
+        ma60 = sum(closes[:60]) / 60 if len(closes) >= 60 else None
+
+        price = current_price if current_price else closes[0]
+
+        parts = []
+        signals = {"bullish": 0, "bearish": 0}
+
+        # 현재가 vs MA5
+        if price > ma5:
+            parts.append(f"5일선({ma5:,.0f}) 위")
+            signals["bullish"] += 1
+        else:
+            parts.append(f"5일선({ma5:,.0f}) 아래")
+            signals["bearish"] += 1
+
+        # 현재가 vs MA20
+        if ma20:
+            if price > ma20:
+                parts.append(f"20일선({ma20:,.0f}) 위")
+                signals["bullish"] += 1
+            else:
+                parts.append(f"20일선({ma20:,.0f}) 아래")
+                signals["bearish"] += 1
+
+        # 현재가 vs MA60
+        if ma60:
+            if price > ma60:
+                parts.append(f"60일선({ma60:,.0f}) 위")
+                signals["bullish"] += 1
+            else:
+                parts.append(f"60일선({ma60:,.0f}) 아래")
+                signals["bearish"] += 1
+
+        # 골든크로스 / 데드크로스
+        cross = ""
+        if ma20 and len(closes) >= 21:
+            prev_ma5 = sum(closes[1:6]) / 5
+            prev_ma20 = sum(closes[1:21]) / 20
+            if prev_ma5 <= prev_ma20 and ma5 > ma20:
+                cross = "\U0001f31f 골든크로스(5/20)"
+                signals["bullish"] += 2
+            elif prev_ma5 >= prev_ma20 and ma5 < ma20:
+                cross = "\U0001f480 데드크로스(5/20)"
+                signals["bearish"] += 2
+
+        # 종합 판정
+        total_bull = signals["bullish"]
+        total_bear = signals["bearish"]
+
+        if total_bull >= 4:
+            state = "\U0001f7e2 강세 (Strong Bullish)"
+        elif total_bull > total_bear:
+            state = "\U0001f7e2 상승추세 (Bullish)"
+        elif total_bear >= 4:
+            state = "\U0001f534 약세 (Strong Bearish)"
+        elif total_bear > total_bull:
+            state = "\U0001f534 하락추세 (Bearish)"
+        else:
+            state = "\U0001f7e1 횡보 (Neutral)"
+
+        ma_detail = " | ".join(parts)
+        if cross:
+            ma_detail += f" | {cross}"
+
+        return state, ma_detail
+    except Exception:
+        return "\u2753 계산 불가", ""
+
+
 # ============================================================
 # 종목 추출
 # ============================================================
@@ -345,17 +546,15 @@ def extract_stock_codes(text):
         return []
     found = set()
     for m in STOCK_CODE_PATTERN.finditer(text):
-        code = m.group(1)
+        code = m.group()
         if code != "000000":
             found.add(code)
-
     sorted_names = sorted(STOCK_MAP.keys(), key=len, reverse=True)
     for name in sorted_names:
         if name in text or name.upper() in text.upper():
             code = STOCK_MAP[name]
             if code and code != "None":
                 found.add(code)
-
     return list(found)
 
 
@@ -377,7 +576,7 @@ def contains_earnings_keyword(text):
 # DUPLICATE DETECTOR
 # ============================================================
 class DuplicateDetector:
-    def __init__(self, threshold=0.85, max_history=500, ttl_hours=24):
+    def __init__(self, threshold=0.85, max_history=500, ttl_hours=6):
         self.threshold = threshold
         self.max_history = max_history
         self.ttl_seconds = ttl_hours * 3600
@@ -396,7 +595,7 @@ class DuplicateDetector:
         self.seen_texts = self.seen_texts[cutoff:]
         cleaned = old_count - len(self.seen_hashes)
         if cleaned:
-            print(f"🧹 Cleaned {cleaned} old entries")
+            print(f"\U0001f9f9 Cleaned {cleaned} old entries")
 
     def _get_hash(self, text):
         cleaned = " ".join(text.lower().split())
@@ -407,21 +606,17 @@ class DuplicateDetector:
         if not text or not text.strip():
             self.stats["skipped"] += 1
             return True
-
         self._clean_old()
         text_hash = self._get_hash(text)
-
         if text_hash in self.seen_hashes:
             self.stats["duplicate"] += 1
             return True
-
         if len(text.strip()) > 30:
             for old_text in self.seen_texts:
                 ratio = SequenceMatcher(None, text.lower(), old_text.lower()).ratio()
                 if ratio >= self.threshold:
                     self.stats["duplicate"] += 1
                     return True
-
         self.seen_hashes[text_hash] = time.time()
         self.seen_texts.append(text)
         self.stats["unique"] += 1
@@ -447,62 +642,57 @@ class AlertCooldown:
         self.last_alert.pop(stock_code, None)
 
 
-async def safe_forward(client, channel, message, max_retries=2):
+async def safe_forward(client, channel, message, max_retries=3):
     for attempt in range(max_retries):
         try:
             await client.forward_messages(channel, message)
             return True
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
-        except Exception as e:
-            if attempt == 0:
+        except Exception:
+            if attempt >= max_retries - 1:
                 raise
-            return False
     return False
 
 
-async def safe_send(client, channel, text, max_retries=2, **kwargs):
+async def safe_send(client, channel, text, max_retries=3, **kwargs):
     for attempt in range(max_retries):
         try:
             await client.send_message(channel, text, **kwargs)
             return True
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
-        except Exception as e:
-            if attempt == 0:
+        except Exception:
+            if attempt >= max_retries - 1:
                 raise
-            return False
     return False
+
+
 # ============================================================
 # MAIN
 # ============================================================
 async def main():
-    print("=" * 60)
-    print("  Telegram Monitor v6.1")
+    print("=" * 50)
+    print("  Telegram Monitor v7.0")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print("  BOT2: 실적/공시 -> @jason_earnings")
-    print("  BOT3: 20분 거래대금 >= 10억 -> @alerts_forme")
-    print("=" * 60)
+    print("  BOT3: 종목별 시세/거래대금/RISK/MA 알림 -> @alerts_forme")
+    print("=" * 50)
 
     if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
         missing = []
-        if not API_ID:
-            missing.append("API_ID")
-        if not API_HASH:
-            missing.append("API_HASH")
-        if not SESSION_STRING:
-            missing.append("SESSION_STRING")
-        if not TARGET_CHANNEL:
-            missing.append("TARGET_CHANNEL")
-        print(f"❌ Missing env vars: {', '.join(missing)}")
+        if not API_ID: missing.append("API_ID")
+        if not API_HASH: missing.append("API_HASH")
+        if not SESSION_STRING: missing.append("SESSION_STRING")
+        if not TARGET_CHANNEL: missing.append("TARGET_CHANNEL")
+        print(f"\u274c Missing env vars: {', '.join(missing)}")
         return
 
     kis_ok = all([KIS_APP_KEY, KIS_APP_SECRET, VOLUME_ALERT_CHANNEL])
     if not kis_ok:
-        print("⚠️ KIS API or VOLUME_ALERT_CHANNEL not set -- volume alerts disabled")
-
+        print("\u26a0\ufe0f KIS API or VOLUME_ALERT_CHANNEL not set -- stock alerts disabled")
     if not EARNINGS_CHANNEL:
-        print("⚠️ EARNINGS_CHANNEL not set -- earnings filter disabled")
+        print("\u26a0\ufe0f EARNINGS_CHANNEL not set -- earnings filter disabled")
 
     kis = KISApi() if kis_ok else None
     detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
@@ -510,36 +700,33 @@ async def main():
 
     client = TelegramClient(
         StringSession(SESSION_STRING),
-        API_ID,
-        API_HASH,
+        API_ID, API_HASH,
         connection_retries=5,
         retry_delay=2,
     )
     await client.start()
-
     me = await client.get_me()
-    print(f"✅ Connected: {me.first_name} (@{me.username})")
+    print(f"\u2705 Connected: {me.first_name} (@{me.username})")
 
     if kis:
         tok = await kis.get_token()
         if tok:
-            print("✅ KIS API connected")
+            print("\u2705 KIS API connected")
         else:
-            print("⚠️ KIS API token failed -- volume alerts disabled")
+            print("\u26a0\ufe0f KIS API token failed -- stock alerts disabled")
             kis = None
 
     monitored_ids = set()
     exclude_ids = set()
-
     for ch in [TARGET_CHANNEL, EARNINGS_CHANNEL, VOLUME_ALERT_CHANNEL]:
         if not ch:
             continue
         try:
             ent = await client.get_entity(ch)
             exclude_ids.add(utils.get_peer_id(ent))
-            print(f"  ✅ Output channel: {ch}")
+            print(f"  \u2705 Output channel: {ch}")
         except Exception as e:
-            print(f"  ❌ Cannot find channel {ch}: {e}")
+            print(f"  \u274c Cannot find channel {ch}: {e}")
 
     async def refresh_dialogs():
         added = 0
@@ -553,28 +740,27 @@ async def main():
                 continue
             if peer_id in monitored_ids:
                 continue
-
             if isinstance(entity, Channel) and entity.broadcast:
                 monitored_ids.add(peer_id)
-                print(f"  📺 Channel: {entity.title} (id: {peer_id})")
+                print(f"  \U0001f4fa Channel: {entity.title} (id: {peer_id})")
                 added += 1
             elif isinstance(entity, Channel) and entity.megagroup:
                 monitored_ids.add(peer_id)
-                print(f"  👥 Megagroup: {entity.title} (id: {peer_id})")
+                print(f"  \U0001f465 Megagroup: {entity.title} (id: {peer_id})")
                 added += 1
             elif isinstance(entity, Chat):
                 monitored_ids.add(peer_id)
-                print(f"  👥 Chat: {entity.title} (id: {peer_id})")
+                print(f"  \U0001f465 Chat: {entity.title} (id: {peer_id})")
                 added += 1
         return added
 
     await refresh_dialogs()
-    print(f"📊 Monitoring {len(monitored_ids)} chats")
-    print(f"📬 All unique (no crypto) -> {TARGET_CHANNEL}")
+    print(f"\U0001f4ca Monitoring {len(monitored_ids)} chats")
+    print(f"\U0001f4ec All unique (no crypto) -> {TARGET_CHANNEL}")
     if EARNINGS_CHANNEL:
-        print(f"📈 실적/공시 -> {EARNINGS_CHANNEL}")
+        print(f"\U0001f4c8 실적/공시 -> {EARNINGS_CHANNEL}")
     if kis:
-        print(f"🚨 20분 거래대금 >= {VOLUME_THRESHOLD/100000000:.0f}억 -> {VOLUME_ALERT_CHANNEL}")
+        print(f"\U0001f6a8 종목 알림 (시세/거래대금/RISK/MA) -> {VOLUME_ALERT_CHANNEL}")
 
     bg_tasks = []
 
@@ -583,7 +769,7 @@ async def main():
             while True:
                 await asyncio.sleep(600)
                 stats = detector.get_stats()
-                print(f"📊 Stats: total={stats['total']} unique={stats['unique']} "
+                print(f"\U0001f4ca Stats: total={stats['total']} unique={stats['unique']} "
                       f"dup={stats['duplicate']} skip={stats['skipped']}")
         except asyncio.CancelledError:
             pass
@@ -594,13 +780,14 @@ async def main():
         try:
             while True:
                 await asyncio.sleep(1800)
-                print("🔄 Refreshing dialog list...")
+                print("\U0001f504 Refreshing dialog list...")
                 added = await refresh_dialogs()
-                print(f"  ✅ {added} new, total: {len(monitored_ids)}")
+                print(f"  \u2705 {added} new, total: {len(monitored_ids)}")
         except asyncio.CancelledError:
             pass
 
     bg_tasks.append(asyncio.create_task(periodic_refresh()))
+
     # --------------------------------------------------------
     @client.on(events.NewMessage())
     async def handler(event):
@@ -610,21 +797,19 @@ async def main():
                 peer_id = utils.get_peer_id(chat)
             except Exception:
                 return
-
             if peer_id in exclude_ids:
                 return
-
             if peer_id not in monitored_ids:
                 if isinstance(chat, (Channel, Chat)):
                     monitored_ids.add(peer_id)
-                    print(f"  🆕 Dynamically added: {getattr(chat, 'title', 'Unknown')}")
+                    print(f"  \U0001f195 Dynamically added: {getattr(chat, 'title', 'Unknown')}")
                 else:
                     return
 
             chat_name = getattr(chat, "title", "Unknown")
             msg = event.message.text
             has_media = event.message.media is not None
-            is_media_only = (not msg) and has_media
+            is_media_only = not msg and has_media
 
             # ====== BOT 1: Media-only ======
             if is_media_only:
@@ -632,9 +817,9 @@ async def main():
                     await safe_forward(client, TARGET_CHANNEL, event.message)
                 except Exception:
                     try:
-                        icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
+                        icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
                         await safe_send(client, TARGET_CHANNEL,
-                            f"📎 {icon}**{chat_name}** [미디어 메시지]",
+                            f"\U0001f4ce {icon}**{chat_name}** [미디어 메시지]",
                             link_preview=False)
                     except Exception:
                         pass
@@ -643,116 +828,155 @@ async def main():
             # ====== BOT 1: Text - filter crypto, dedup ======
             if contains_crypto_keyword(msg):
                 return
-
             if detector.is_duplicate(msg):
                 return
 
-            print(f"📨 [{chat_name}] Unique msg ({len(msg)} chars)")
+            print(f"\U0001f4e8 [{chat_name}] Unique msg ({len(msg)} chars)")
 
             forwarded = False
             try:
                 await safe_forward(client, TARGET_CHANNEL, event.message)
                 forwarded = True
-                print(f"  ✅ Forwarded to {TARGET_CHANNEL}")
-            except Exception as e:
+                print(f"  \u2705 Forwarded to {TARGET_CHANNEL}")
+            except Exception:
                 try:
-                    icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
+                    icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
                     await safe_send(client, TARGET_CHANNEL,
-                        f"{icon}**{chat_name}**\n{msg}", link_preview=False)
+                        f"{icon}**{chat_name}**\n{msg}",
+                        link_preview=False)
                     forwarded = True
                 except Exception:
                     pass
-
             if not forwarded:
-                print(f"  ❌ FAILED to deliver to {TARGET_CHANNEL}!")
+                print(f"  \u274c FAILED to deliver to {TARGET_CHANNEL}!")
+
             # ====== BOT 2: 실적/공시 ======
             if EARNINGS_CHANNEL and contains_earnings_keyword(msg):
-                matched = [kw for kw in EARNINGS_KEYWORDS if kw.lower() in msg.lower()][:3]
-                print(f"  📈 실적/공시: {matched}")
+                matched = [kw for kw in EARNINGS_KEYWORDS if kw.lower() in msg.lower()][:5]
+                print(f"  \U0001f4c8 실적/공시: {matched}")
                 try:
                     await safe_forward(client, EARNINGS_CHANNEL, event.message)
-                    print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                    print(f"  \u2705 -> {EARNINGS_CHANNEL}")
                 except Exception:
                     try:
                         await safe_send(client, EARNINGS_CHANNEL,
-                            f"📈 **[실적/공시]** {chat_name}\n"
-                            f"🔑 {', '.join(matched)}\n\n{msg[:500]}",
+                            f"\U0001f4c8 **[실적/공시]** {chat_name}\n"
+                            f"\U0001f511 {', '.join(matched)}\n"
+                            f"{msg[:500]}",
                             link_preview=False)
                     except Exception:
                         pass
 
-                # ====== BOT 3: 20분 rolling 거래대금 체크 ======
-                if kis and msg:
-                    codes = extract_stock_codes(msg)
-                    for code in codes:
-                        if not cooldown.can_alert(code):
-                            continue
+            # ====== BOT 3: 종목별 시세/거래대금/RISK/MA 알림 ======
+            # Now runs independently - triggers on ANY stock mention
+            if kis and msg:
+                codes = extract_stock_codes(msg)
+                for code in codes:
+                    if not cooldown.can_alert(code):
+                        continue
 
-                        # 1) 현재가 조회
-                        price_info = await kis.get_stock_price(code)
-                        if not price_info:
-                            cooldown.reset(code)
-                            continue
+                    # 1) 현재가 조회
+                    price_info = await kis.get_stock_price(code)
+                    if not price_info:
+                        cooldown.reset(code)
+                        continue
 
-                        name = price_info["name"] or code
+                    name = price_info.get("name", code)
 
-                        # 2) 20분 rolling 거래대금 조회
-                        rolling_vol = await kis.get_rolling_volume(code, minutes=20)
+                    # 2) 20분 rolling 거래대금 조회
+                    rolling_vol = await kis.get_rolling_volume(code, minutes=20)
 
-                        print(f"  💰 [{code}] {name} 20분 거래대금: "
-                              f"{rolling_vol/100000000:.2f}억")
+                    # 3) 일별 종가 조회 (MA 계산용)
+                    daily_closes = await kis.get_daily_prices(code, count=60)
 
-                        # 기준: 20분 rolling 거래대금 >= 10억원
-                        if rolling_vol >= VOLUME_THRESHOLD:
-                            alert = (
-                                f"🚨 **거래대금 매수신호 알림**\n"
-                                f"📌 **{name}** ({code})\n"
-                                f"💰 현재가: {price_info['price']:,}원 "
-                                f"({price_info['change_rate']}%)\n"
-                                f"📊 20분 거래대금: {rolling_vol/100000000:.1f}억\n"
-                                f"📍 누적거래량: {price_info['acml_vol']:,}주\n"
-                                f"💬 출처: {chat_name}\n"
-                                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-                            )
-                            try:
-                                await safe_send(client, VOLUME_ALERT_CHANNEL,
-                                    alert, link_preview=False)
-                                print(f"  🚨 ALERT: {name} ({code}) ✅")
-                            except Exception as e:
-                                print(f"  ❌ Alert failed: {e}")
-                        else:
-                            cooldown.reset(code)
+                    # 4) RISK 판정
+                    risk_label, risk_emoji = compute_risk_level(price_info)
 
-                        await asyncio.sleep(0.2)
+                    # 5) 이동평균 상태
+                    ma_state, ma_detail = compute_ma_state(daily_closes, price_info["price"])
+
+                    # 6) 등락 방향 이모지
+                    change_val = float(price_info.get("change_rate", "0"))
+                    if change_val > 0:
+                        direction = "\U0001f53a"
+                    elif change_val < 0:
+                        direction = "\U0001f53b"
+                    else:
+                        direction = "\u25ab"
+
+                    print(f"  \U0001f4b0 [{code}] {name} 현재가: {price_info['price']:,}원 "
+                          f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억")
+
+                    # 알림 메시지 구성
+                    alert_lines = [
+                        f"\U0001f514 **종목 알림 ({name})**",
+                        f"",
+                        f"\U0001f4cc **{name}** ({code})",
+                        f"\U0001f4b0 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
+                        f"\U0001f4c8 시가: {price_info.get('open_price', 0):,} | 고가: {price_info.get('high_price', 0):,} | 저가: {price_info.get('low_price', 0):,}",
+                        f"\U0001f4ca 거래량: {price_info.get('acml_vol', 0):,}주",
+                        f"\U0001f4b5 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
+                        f"\U0001f4b5 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
+                        f"",
+                        f"\u26a0\ufe0f RISK: {risk_label}",
+                        f"\U0001f4c9 이동평균: {ma_state}",
+                    ]
+                    if ma_detail:
+                        alert_lines.append(f"  \U000027a1 {ma_detail}")
+
+                    # 52주 고저
+                    w52h = price_info.get("w52_hgpr", 0)
+                    w52l = price_info.get("w52_lwpr", 0)
+                    if w52h and w52l:
+                        pos_pct = ((price_info["price"] - w52l) / (w52h - w52l) * 100) if w52h > w52l else 0
+                        alert_lines.append(f"\U0001f4cd 52주: {w52l:,} ~ {w52h:,} (현재 {pos_pct:.0f}% 위치)")
+
+                    alert_lines.extend([
+                        f"",
+                        f"\U0001f4ac 출처: {chat_name}",
+                        f"\u23f0 {datetime.now().strftime('%H:%M:%S')}",
+                    ])
+
+                    alert = "\n".join(alert_lines)
+
+                    try:
+                        await safe_send(client, VOLUME_ALERT_CHANNEL,
+                            alert, link_preview=False)
+                        print(f"  \U0001f6a8 ALERT: {name} ({code}) \u2705")
+                    except Exception as e:
+                        print(f"  \u274c Alert failed: {e}")
+
+                    await asyncio.sleep(0.3)
 
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
-            print(f"  ❌ Handler error: {e}")
+            print(f"  \u274c Handler error: {e}")
             import traceback
             traceback.print_exc()
-    print(f"🎧 Listening... (v6.1)")
+
+    print(f"\U0001f3a7 Listening... (v7.0)")
 
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("Shutting down...")
     finally:
         for task in bg_tasks:
             task.cancel()
         await asyncio.gather(*bg_tasks, return_exceptions=True)
         if kis:
             await kis.close()
-        print("✅ Cleanup complete")
+        print("\u2705 Cleanup complete")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nBye!")
+        print("Bye!")
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f"\u274c Fatal error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
