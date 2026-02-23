@@ -1,5 +1,5 @@
 """
-Telegram Channel & Group Monitor v7.3
+Telegram Channel & Group Monitor v7.4
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
@@ -734,7 +734,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 # ============================================================
 async def main():
     print("=" * 50)
-    print("  Telegram Monitor v7.3")
+    print("  Telegram Monitor v7.4")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print("  BOT2: \uc2e4\uc801/\uacf5\uc2dc -> @jason_earnings")
     print("  BOT3: \uc885\ubaa9\ubcc4 \uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA + OCR -> @alerts_forme")
@@ -969,6 +969,11 @@ async def main():
                         cooldown.reset(code)
                         continue
 
+                    # Filter: skip if cumulative trading value < 50억
+                    if price_info.get("acml_tr_pbmn", 0) < 5_000_000_000:
+                        cooldown.reset(code)
+                        continue
+
                     api_name = price_info.get("name", "")
                     universe_name = stock_universe.lookup_name(code) or ""
                     # Use API name if it's a real name (not just the code), otherwise use universe name
@@ -1051,7 +1056,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.3)")
+    print(f"\U0001f3a7 Listening... (v7.4)")
 
     try:
         await client.run_until_disconnected()
