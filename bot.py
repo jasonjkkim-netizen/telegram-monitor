@@ -1,9 +1,14 @@
 """
-Telegram Channel & Group Monitor v7.2
+Telegram Channel & Group Monitor v7.3
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v7.3 Changes:
+    - BOT 2: Split EARNINGS_KEYWORDS into anchor + data two-layer filter
+    - Requires both a 공시/실적 context keyword AND a financial data keyword
+    - Reduces false positives from general market commentary
 
 v7.2 Changes:
     - Fixed BOT 3: stock name now reliably shown in alerts
@@ -118,25 +123,34 @@ CRYPTO_KEYWORDS = [
 ]
 
 # ============================================================
-# \uc2e4\uc801 + \uacf5\uc2dc KEYWORDS (BOT 2)
+# 실적 + 공시 ANCHOR KEYWORDS (BOT 2) - context indicators
 # ============================================================
-EARNINGS_KEYWORDS = [
-    "\uc2e4\uc801", "\uc7a0\uc815\uc2e4\uc801", "\uc2e4\uc801\ubc1c\ud45c", "\uc2e4\uc801\uacf5\uc2dc", "\uc2e4\uc801\ucd94\uc815", "\uc2e4\uc801\uc804\ub9dd",
-    "\uc2e4\uc801\uc2dc\uc98c", "\uc2e4\uc801\uc1fc\ud06c", "\uc2e4\uc801\uc11c\ud504\ub77c\uc774\uc988",
-    "\uc5b4\ub2dd\uc1fc\ud06c", "\uc5b4\ub2dd\uc11c\ud504\ub77c\uc774\uc988", "\ucee8\uc13c\uc11c\uc2a4",
-    "\uc601\uc5c5\uc774\uc775", "\ub2f9\uae30\uc21c\uc774\uc775", "\uc21c\uc774\uc775", "\ub9e4\ucd9c\uc561", "\ub9e4\ucd9c",
-    "\uc601\uc5c5\uc190\uc2e4", "\uc21c\uc190\uc2e4", "\ub2f9\uae30\uc21c\uc190\uc2e4",
-    "\uc801\uc790\uc804\ud658", "\ud751\uc790\uc804\ud658", "\uc801\uc790\uc9c0\uc18d", "\ud751\uc790\uc9c0\uc18d",
-    "\ubd84\uae30\uc2e4\uc801", "1\ubd84\uae30", "2\ubd84\uae30", "3\ubd84\uae30", "4\ubd84\uae30",
+EARNINGS_ANCHOR_KEYWORDS = [
+    "공시", "공시내용", "수시공시", "주요공시",
+    "실적발표", "실적공시", "잠정실적", "잠정치", "확정치",
+    "사업보고서", "분기보고서", "반기보고서",
+    "연결기준", "별도기준",
+    "실적", "잠정실적", "실적시즌",
+    "실적쇼크", "실적서프라이즈", "어닝쇼크", "어닝서프라이즈",
+]
+
+# ============================================================
+# 실적 + 공시 DATA KEYWORDS (BOT 2) - financial data points
+# ============================================================
+EARNINGS_DATA_KEYWORDS = [
+    "영업이익", "당기순이익", "순이익", "매출액", "매출",
+    "영업손실", "순손실", "당기순손실",
+    "적자전환", "흑자전환", "적자지속", "흑자지속",
+    "매출총이익", "EBITDA", "EPS", "BPS",
+    "영업이익률", "순이익률",
+    "컨센서스",
+    "전년대비", "전분기대비", "YoY", "QoQ",
+    "1분기", "2분기", "3분기", "4분기",
     "1Q", "2Q", "3Q", "4Q",
-    "\ubc18\uae30\uc2e4\uc801", "\uc5f0\uac04\uc2e4\uc801",
-    "\uc601\uc5c5\uc774\uc775\ub960", "\uc21c\uc774\uc775\ub960", "\ub9e4\ucd9c\ucd1d\uc774\uc775",
-    "EBITDA", "EPS", "BPS", "ROE", "ROA", "PER", "PBR",
-    "\uc804\ub144\ub300\ube44", "\uc804\ubd84\uae30\ub300\ube44", "YoY", "QoQ",
-    "\uc7a0\uc815\uce58", "\ud655\uc815\uce58", "\uc5f0\uacb0\uae30\uc900", "\ubcc4\ub3c4\uae30\uc900",
-    "\uc0ac\uc5c5\ubcf4\uace0\uc11c", "\ubd84\uae30\ubcf4\uace0\uc11c", "\ubc18\uae30\ubcf4\uace0\uc11c",
-    "\uacf5\uc2dc", "\uacf5\uc2dc\ub0b4\uc6a9", "\uc218\uc2dc\uacf5\uc2dc", "\uc8fc\uc694\uacf5\uc2dc",
-    "\ud310\ub9e4\ub7c9", "\ud310\ub9e4\uc2e4\uc801", "\uc218\uc8fc", "\uc218\uc8fc\uc794\uace0", "\uc218\uc8fc\uc561",
+    "반기실적", "연간실적",
+    "ROE", "ROA", "PER", "PBR",
+    "판매량", "판매실적",
+    "수주", "수주잔고", "수주액",
 ]
 
 # ============================================================
@@ -610,10 +624,13 @@ def contains_crypto_keyword(text):
 
 
 def contains_earnings_keyword(text):
+    """Requires BOTH an anchor keyword (공시/실적 context) AND a data keyword."""
     if not text:
         return False
     lower = text.lower()
-    return any(kw.lower() in lower for kw in EARNINGS_KEYWORDS)
+    has_anchor = any(kw.lower() in lower for kw in EARNINGS_ANCHOR_KEYWORDS)
+    has_data = any(kw.lower() in lower for kw in EARNINGS_DATA_KEYWORDS)
+    return has_anchor and has_data
 
 
 # ============================================================
@@ -717,7 +734,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 # ============================================================
 async def main():
     print("=" * 50)
-    print("  Telegram Monitor v7.2")
+    print("  Telegram Monitor v7.3")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print("  BOT2: \uc2e4\uc801/\uacf5\uc2dc -> @jason_earnings")
     print("  BOT3: \uc885\ubaa9\ubcc4 \uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA + OCR -> @alerts_forme")
@@ -919,7 +936,7 @@ async def main():
 
             # ====== BOT 2: \uc2e4\uc801/\uacf5\uc2dc ======
             if EARNINGS_CHANNEL and msg and contains_earnings_keyword(msg):
-                matched = [kw for kw in EARNINGS_KEYWORDS if kw.lower() in msg.lower()][:5]
+                matched = [kw for kw in EARNINGS_ANCHOR_KEYWORDS + EARNINGS_DATA_KEYWORDS if kw.lower() in msg.lower()][:5]
                 print(f"  \U0001f4c8 \uc2e4\uc801/\uacf5\uc2dc: {matched}")
                 try:
                     await safe_forward(client, EARNINGS_CHANNEL, event.message)
@@ -1034,7 +1051,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.2)")
+    print(f"\U0001f3a7 Listening... (v7.3)")
 
     try:
         await client.run_until_disconnected()
