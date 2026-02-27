@@ -1,9 +1,16 @@
 """
-Telegram Channel & Group Monitor v7.4
+Telegram Channel & Group Monitor v7.5
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v7.5 Changes:
+    - BOT 2: Added standalone keywords "이익" and "순익" to EARNINGS_DATA_KEYWORDS
+    - BOT 2: Added high-confidence keyword bypass (영업이익, 당기순이익, 순이익, 순익, 매출액
+      with numbers can trigger without anchor keyword)
+    - BOT 2: Now also checks OCR text from images for earnings keywords
+    - Reduces missed financial reports from image-based messages
 
 v7.3 Changes:
     - BOT 2: Split EARNINGS_KEYWORDS into anchor + data two-layer filter
@@ -151,7 +158,18 @@ EARNINGS_DATA_KEYWORDS = [
     "ROE", "ROA", "PER", "PBR",
     "판매량", "판매실적",
     "수주", "수주잔고", "수주액",
+    "이익", "순익",
 ]
+
+# ============================================================
+# HIGH-CONFIDENCE EARNINGS KEYWORDS (BOT 2) - bypass anchor requirement
+# These keywords, when appearing with numbers, strongly indicate financial data
+# ============================================================
+HIGH_CONFIDENCE_EARNINGS_KEYWORDS = [
+    "영업이익", "당기순이익", "순이익", "순익", "매출액",
+    "영업손실", "순손실", "당기순손실", "매출",
+]
+FINANCIAL_NUMBER_PATTERN = re.compile(r'[\d,]+\s*(억|조|원|백만|천만)')
 
 # ============================================================
 # DYNAMIC STOCK UNIVERSE (replaces hardcoded STOCK_MAP)
@@ -624,13 +642,29 @@ def contains_crypto_keyword(text):
 
 
 def contains_earnings_keyword(text):
-    """Requires BOTH an anchor keyword (공시/실적 context) AND a data keyword."""
+    """
+    Two-layer filter with high-confidence bypass.
+    1) Standard: requires BOTH anchor + data keyword
+    2) Bypass: high-confidence keywords (영업이익, 순이익, etc.) with a number pattern
+       strongly indicate financial data even without an anchor keyword.
+    """
     if not text:
         return False
     lower = text.lower()
+
+    # Standard two-layer check
     has_anchor = any(kw.lower() in lower for kw in EARNINGS_ANCHOR_KEYWORDS)
     has_data = any(kw.lower() in lower for kw in EARNINGS_DATA_KEYWORDS)
-    return has_anchor and has_data
+    if has_anchor and has_data:
+        return True
+
+    # High-confidence bypass: keyword + number pattern (e.g., "영업이익 1조2천억")
+    has_high_conf = any(kw.lower() in lower for kw in HIGH_CONFIDENCE_EARNINGS_KEYWORDS)
+    has_number = bool(FINANCIAL_NUMBER_PATTERN.search(text))
+    if has_high_conf and has_number:
+        return True
+
+    return False
 
 
 # ============================================================
@@ -734,7 +768,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 # ============================================================
 async def main():
     print("=" * 50)
-    print("  Telegram Monitor v7.4")
+    print("  Telegram Monitor v7.5")
     print("  BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print("  BOT2: \uc2e4\uc801/\uacf5\uc2dc -> @jason_earnings")
     print("  BOT3: \uc885\ubaa9\ubcc4 \uc2dc\uc138/\uac70\ub798\ub300\uae08/RISK/MA + OCR -> @alerts_forme")
@@ -935,8 +969,8 @@ async def main():
                     print(f"  \u274c FAILED to deliver to {TARGET_CHANNEL}!")
 
             # ====== BOT 2: \uc2e4\uc801/\uacf5\uc2dc ======
-            if EARNINGS_CHANNEL and msg and contains_earnings_keyword(msg):
-                matched = [kw for kw in EARNINGS_ANCHOR_KEYWORDS + EARNINGS_DATA_KEYWORDS if kw.lower() in msg.lower()][:5]
+            if EARNINGS_CHANNEL and (msg or ocr_text) and contains_earnings_keyword(combined_text):
+                matched = [kw for kw in EARNINGS_ANCHOR_KEYWORDS + EARNINGS_DATA_KEYWORDS + HIGH_CONFIDENCE_EARNINGS_KEYWORDS if kw.lower() in combined_text.lower()][:5]
                 print(f"  \U0001f4c8 \uc2e4\uc801/\uacf5\uc2dc: {matched}")
                 try:
                     await safe_forward(client, EARNINGS_CHANNEL, event.message)
@@ -946,7 +980,7 @@ async def main():
                         await safe_send(client, EARNINGS_CHANNEL,
                             f"\U0001f4c8 **[\uc2e4\uc801/\uacf5\uc2dc]** {chat_name}\n"
                             f"\U0001f511 {', '.join(matched)}\n"
-                            f"{msg[:500]}",
+                            f"{combined_text[:500]}",
                             link_preview=False)
                     except Exception:
                         pass
@@ -1056,7 +1090,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.4)")
+    print(f"\U0001f3a7 Listening... (v7.5)")
 
     try:
         await client.run_until_disconnected()
