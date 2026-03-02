@@ -1,9 +1,17 @@
 """
-Telegram Channel & Group Monitor v7.7
+Telegram Channel & Group Monitor v7.8
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v7.8 Changes:
+  - Fixed master file parsing: now uses official KIS structure
+    (code[0:9], skip standard code[9:21], name[21:len-228/222])
+  - Fixed KIS API market code: KOSDAQ stocks now queried with "Q" instead of "J"
+    (stored per-code via code_to_market dict)
+  - Removed extract_stock_name ISIN hack (no longer needed with correct parsing)
+  - Handles duplicate stock names across KOSPI/KOSDAQ by appending market suffix
 
 v7.7 Changes:
   - Fixed BOT 1: media-only messages now checked via OCR against crypto filter & dedup
@@ -67,6 +75,10 @@ KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 KIS_KOSPI_MST_URL = "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
 KIS_KOSDAQ_MST_URL = "https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip"
+
+# Tail lengths per official KIS header structure
+_KOSPI_TAIL_LEN = 228
+_KOSDAQ_TAIL_LEN = 222
 
 # ============================================================
 # CRYPTO FILTER KEYWORDS (BOT 1) - frozenset for O(1) lookup
@@ -135,18 +147,60 @@ FINANCIAL_NUMBER_PATTERN = re.compile(r'[\d,]+\s*(억|조|원|백만|천만)')
 STOCK_CODE_PATTERN = re.compile(r'\b(\d{6})\b')
 
 # ============================================================
-# DYNAMIC STOCK UNIVERSE
+# DYNAMIC STOCK UNIVERSE (v7.8: correct KIS master file parsing)
 # ============================================================
 class StockUniverse:
-    """Downloads KIS master files to build name<->code mappings. Refreshes daily."""
+    """
+    Downloads KIS master files to build name<->code mappings.
+    v7.8: Uses official KIS file structure:
+      - KOSPI row: short_code[0:9] + std_code[9:21] + name[21:len-228] + tail[228]
+      - KOSDAQ row: short_code[0:9] + std_code[9:21] + name[21:len-222] + tail[222]
+    Also stores market type (J=KOSPI, Q=KOSDAQ) per code for correct API calls.
+    """
 
     def __init__(self):
         self.name_to_code = {}
         self.code_to_name = {}
+        self.code_to_market = {}   # {"005930": "J", "293490": "Q", ...}
         self.all_codes = set()
         self.last_refresh = 0
         self.refresh_interval = 86400
         self._sorted_names = []
+
+    def _parse_master_file(self, raw_bytes, tail_len, market_code):
+        """Parse a single KIS master file (KOSPI or KOSDAQ).
+
+        Args:
+            raw_bytes: raw file bytes (cp949 encoded)
+            tail_len: fixed-width tail length (228 for KOSPI, 222 for KOSDAQ)
+            market_code: "J" for KOSPI, "Q" for KOSDAQ
+
+        Returns:
+            (name_to_code, code_to_name, code_to_market) dicts
+        """
+        name_to_code = {}
+        code_to_name = {}
+        code_to_market = {}
+        text = raw_bytes.decode("cp949", errors="ignore")
+        for row in text.strip().split("\n"):
+            if not row or len(row) <= tail_len + 21:
+                continue
+            # Official structure: front part is row[0 : len(row)-tail_len]
+            front = row[:len(row) - tail_len]
+            short_code_raw = front[0:9].strip()
+            # Extract 6-digit code from the 9-char short code field
+            code_match = re.search(r'(\d{6})', short_code_raw)
+            if not code_match:
+                continue
+            code = code_match.group(1)
+            # Name starts at byte 21 (after short_code[0:9] + std_code[9:21])
+            name = front[21:].strip()
+            if not name:
+                continue
+            name_to_code[name] = code
+            code_to_name[code] = name
+            code_to_market[code] = market_code
+        return name_to_code, code_to_name, code_to_market
 
     async def load(self, session=None):
         close_session = False
@@ -154,11 +208,12 @@ class StockUniverse:
             session = aiohttp.ClientSession()
             close_session = True
         try:
-            name_to_code = {}
-            code_to_name = {}
-            for url, market in [
-                (KIS_KOSPI_MST_URL, "KOSPI"),
-                (KIS_KOSDAQ_MST_URL, "KOSDAQ"),
+            all_name_to_code = {}
+            all_code_to_name = {}
+            all_code_to_market = {}
+            for url, market, market_code, tail_len in [
+                (KIS_KOSPI_MST_URL, "KOSPI", "J", _KOSPI_TAIL_LEN),
+                (KIS_KOSDAQ_MST_URL, "KOSDAQ", "Q", _KOSDAQ_TAIL_LEN),
             ]:
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -169,28 +224,31 @@ class StockUniverse:
                     with zipfile.ZipFile(io.BytesIO(data)) as zf:
                         for filename in zf.namelist():
                             raw = zf.read(filename)
-                            text = raw.decode("cp949", errors="ignore")
-                            for line in text.strip().split("\n"):
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                code_match = re.search(r'(\d{6})', line[:9])
-                                if not code_match:
-                                    continue
-                                code = code_match.group(1)
-                                name = line[9:49].strip()
-                                if name:
-                                    name_to_code[name] = code
-                                    code_to_name[code] = name
-                    print(f"\u2705 {market} master loaded: {len(code_to_name)} stocks")
+                            n2c, c2n, c2m = self._parse_master_file(raw, tail_len, market_code)
+                            # Handle duplicate names across markets
+                            for name, code in n2c.items():
+                                if name in all_name_to_code and all_name_to_code[name] != code:
+                                    # Name collision: append market suffix to both
+                                    existing_code = all_name_to_code.pop(name)
+                                    existing_market = all_code_to_market.get(existing_code, "J")
+                                    suffixed_old = f"{name}({existing_market})"
+                                    suffixed_new = f"{name}({market_code})"
+                                    all_name_to_code[suffixed_old] = existing_code
+                                    all_name_to_code[suffixed_new] = code
+                                else:
+                                    all_name_to_code[name] = code
+                            all_code_to_name.update(c2n)
+                            all_code_to_market.update(c2m)
+                    print(f"\u2705 {market} master loaded: {len(c2n)} stocks")
                 except Exception as e:
                     print(f"\u274c Error loading {market} master: {e}")
-            if name_to_code:
-                self.name_to_code = name_to_code
-                self.code_to_name = code_to_name
-                self.all_codes = set(code_to_name.keys())
+            if all_name_to_code:
+                self.name_to_code = all_name_to_code
+                self.code_to_name = all_code_to_name
+                self.code_to_market = all_code_to_market
+                self.all_codes = set(all_code_to_name.keys())
                 self._sorted_names = sorted(
-                    (n for n in name_to_code if len(n) >= 2),
+                    (n for n in all_name_to_code if len(n) >= 2),
                     key=len, reverse=True
                 )
                 self.last_refresh = time.time()
@@ -211,6 +269,10 @@ class StockUniverse:
 
     def lookup_name(self, code):
         return self.code_to_name.get(code)
+
+    def lookup_market(self, code):
+        """Return market division code: 'J' for KOSPI, 'Q' for KOSDAQ."""
+        return self.code_to_market.get(code, "J")
 
     def find_stocks_in_text(self, text):
         if not text:
@@ -250,7 +312,7 @@ async def extract_text_from_image(client, message):
         return ""
 
 # ============================================================
-# KIS API
+# KIS API (v7.8: uses per-code market division)
 # ============================================================
 class KISApi:
     def __init__(self):
@@ -297,12 +359,13 @@ class KISApi:
             "Content-Type": "application/json; charset=utf-8",
         }
 
-    async def get_stock_price(self, stock_code):
+    async def get_stock_price(self, stock_code, market_code="J"):
+        """현재가 조회. market_code: 'J'=KOSPI, 'Q'=KOSDAQ."""
         token = await self.get_token()
         if not token:
             return None
         await self.ensure_session()
-        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
+        params = {"FID_COND_MRKT_DIV_CODE": market_code, "FID_INPUT_ISCD": stock_code}
         try:
             async with self.session.get(
                 f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
@@ -336,7 +399,7 @@ class KISApi:
             print(f"\u274c 시세에러 [{stock_code}]: {e}")
             return None
 
-    async def get_rolling_volume(self, stock_code, minutes=20):
+    async def get_rolling_volume(self, stock_code, market_code="J", minutes=20):
         """최근 N분 rolling 거래대금 (validates candle timestamps)."""
         token = await self.get_token()
         if not token:
@@ -345,7 +408,7 @@ class KISApi:
         now = datetime.now()
         params = {
             "FID_ETC_CLS_CODE": "",
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": market_code,
             "FID_INPUT_ISCD": stock_code,
             "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
             "FID_PW_DATA_INCU_YN": "N",
@@ -383,7 +446,7 @@ class KISApi:
             print(f"\u274c 분봉에러 [{stock_code}]: {e}")
             return 0
 
-    async def get_daily_prices(self, stock_code, count=60):
+    async def get_daily_prices(self, stock_code, market_code="J", count=60):
         """일별 종가 조회 (validates reverse-chronological order)."""
         token = await self.get_token()
         if not token:
@@ -392,7 +455,7 @@ class KISApi:
         today = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
         params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": market_code,
             "FID_INPUT_ISCD": stock_code,
             "FID_INPUT_DATE_1": start_date,
             "FID_INPUT_DATE_2": today,
@@ -554,20 +617,8 @@ def contains_earnings_keyword(text):
         return True
     return False
 
-
-def extract_stock_name(raw_name, stock_code):
-    """Strip ISIN prefix from KIS API name (e.g. 'KR7079550000LIG넥스원' -> 'LIG넥스원')."""
-    if not raw_name or raw_name == stock_code or raw_name.isdigit():
-        return None
-    isin_match = re.match(r'^[A-Z]{2}\d{10,12}(.+)$', raw_name)
-    if isin_match:
-        cleaned = isin_match.group(1).strip()
-        if cleaned:
-            return cleaned
-    return raw_name
-
 # ============================================================
-# SIMHASH DUPLICATE DETECTOR (v7.6+)
+# SIMHASH DUPLICATE DETECTOR
 # ============================================================
 def _simhash(text, hashbits=64):
     cleaned = " ".join(text.lower().split())
@@ -630,7 +681,6 @@ class DuplicateDetector:
             if text_hash in self.seen_hashes:
                 self.stats["duplicate"] += 1
                 return True
-            # v7.7: lowered threshold from 30 to 15 chars
             if len(text.strip()) > 15:
                 text_simhash = _simhash(text)
                 for old_simhash, _ in self.seen_simhashes:
@@ -692,7 +742,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v7.7")
+    print(" Telegram Monitor v7.8")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
     print(" BOT3: 종목별 시세/거래대금/RISK/MA + OCR -> @alerts_forme")
@@ -771,7 +821,6 @@ async def main():
                     label = "\U0001f4fa Channel" if is_channel else "\U0001f465 Group"
                     print(f"  {label}: {entity.title} (id: {peer_id})")
                     added += 1
-        # Prune stale: remove IDs no longer in dialogs
         stale = monitored_ids - current_ids - exclude_ids
         if stale:
             monitored_ids.difference_update(stale)
@@ -791,7 +840,6 @@ async def main():
     bg_tasks = []
     shutdown_event = asyncio.Event()
 
-    # SIGTERM handler for graceful Docker/Heroku shutdown
     def _signal_handler():
         print("\U0001f6d1 Received shutdown signal...")
         shutdown_event.set()
@@ -802,7 +850,7 @@ async def main():
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            pass  # Windows doesn't support add_signal_handler
+            pass
 
     async def heartbeat():
         try:
@@ -866,7 +914,6 @@ async def main():
 
             # ====== BOT 1: Unique messages (no crypto) ======
             if not msg and not ocr_text:
-                # Pure media, no text at all - forward as-is
                 if has_media:
                     try:
                         await safe_forward(client, TARGET_CHANNEL, event.message)
@@ -878,11 +925,9 @@ async def main():
                             pass
                 return
 
-            # Check crypto filter on combined text (msg + OCR)
             if contains_crypto_keyword(combined_text):
                 return
 
-            # Dedup on combined text (v7.7 fix: was msg-only before)
             if await detector.is_duplicate(combined_text):
                 return
 
@@ -919,17 +964,19 @@ async def main():
                     except Exception:
                         pass
 
-            # ====== BOT 3: 종목 알림 ======
+            # ====== BOT 3: 종목 알림 (v7.8: correct market code per stock) ======
             if kis and combined_text:
                 codes = stock_universe.find_stocks_in_text(combined_text)
-                # v7.7 fix: pre-compute text-only stock codes once
                 text_codes = set(stock_universe.find_stocks_in_text(msg)) if msg else set()
 
                 for code in codes:
                     if not cooldown.can_alert(code):
                         continue
 
-                    price_info = await kis.get_stock_price(code)
+                    # v7.8: look up correct market code for this stock
+                    mkt = stock_universe.lookup_market(code)
+
+                    price_info = await kis.get_stock_price(code, market_code=mkt)
                     if not price_info:
                         cooldown.reset(code)
                         continue
@@ -938,13 +985,14 @@ async def main():
                         cooldown.reset(code)
                         continue
 
-                    api_name = price_info.get("name", "")
-                    cleaned_api_name = extract_stock_name(api_name, code)
+                    # v7.8: name comes directly from correctly parsed universe
+                    # (no more ISIN stripping needed)
+                    api_name = (price_info.get("name") or "").strip()
                     universe_name = stock_universe.lookup_name(code) or ""
-                    name = cleaned_api_name or universe_name or code
+                    name = universe_name or api_name or code
 
-                    rolling_vol = await kis.get_rolling_volume(code, minutes=20)
-                    daily_closes = await kis.get_daily_prices(code, count=60)
+                    rolling_vol = await kis.get_rolling_volume(code, market_code=mkt, minutes=20)
+                    daily_closes = await kis.get_daily_prices(code, market_code=mkt, count=60)
                     risk_label, risk_emoji = compute_risk_level(price_info)
                     ma_state, ma_detail = compute_ma_state(daily_closes, price_info["price"])
 
@@ -953,15 +1001,16 @@ async def main():
 
                     from_ocr = ocr_text and code not in text_codes
                     source_tag = " [OCR]" if from_ocr else ""
+                    mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
                     print(
-                        f"  \U0001f4b0{source_tag} [{code}] {name} {price_info['price']:,}원 "
+                        f"  \U0001f4b0{source_tag} [{code}/{mkt_label}] {name} {price_info['price']:,}원 "
                         f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억"
                     )
 
                     alert_lines = [
                         f"\U0001f514 **종목 알림 ({name})**",
                         "",
-                        f"\U0001f4cc **{name}** ({code})",
+                        f"\U0001f4cc **{name}** ({code} | {mkt_label})",
                         f"\U0001f4b0 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
                         f"\U0001f4c8 시가: {price_info.get('open_price', 0):,} | "
                         f"고가: {price_info.get('high_price', 0):,} | "
@@ -994,7 +1043,7 @@ async def main():
 
                     try:
                         await safe_send(client, VOLUME_ALERT_CHANNEL, "\n".join(alert_lines), link_preview=False)
-                        print(f"  \U0001f6a8 ALERT: {name} ({code}) \u2705")
+                        print(f"  \U0001f6a8 ALERT: {name} ({code}/{mkt_label}) \u2705")
                     except Exception as e:
                         print(f"  \u274c Alert failed: {e}")
                     await asyncio.sleep(0.3)
@@ -1006,7 +1055,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.7)")
+    print(f"\U0001f3a7 Listening... (v7.8)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
