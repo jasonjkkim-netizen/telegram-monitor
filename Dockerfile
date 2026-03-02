@@ -3,15 +3,21 @@ FROM python:3.13-slim
 # Install Tesseract OCR with Korean language support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
-        tesseract-ocr-kor \
-            libleptonica-dev \
-                && rm -rf /var/lib/apt/lists/*
+    tesseract-ocr-kor \
+    libleptonica-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-                WORKDIR /app
+# Create non-root user
+RUN useradd --create-home appuser
 
-                COPY requirements.txt .
-                RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
 
-                COPY . .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-                CMD ["python", "bot.py"]
+COPY . .
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+CMD ["python", "bot.py"]
