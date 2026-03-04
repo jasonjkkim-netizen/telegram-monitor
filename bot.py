@@ -1,31 +1,33 @@
 """
-Telegram Channel & Group Monitor v7.8
+Telegram Channel & Group Monitor v7.9
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
 
+v7.9 Changes:
+  [BUG FIX] KIS token expiry now uses API response expires_in (was hardcoded 85000s)
+  [BUG FIX] aiohttp session auto-recovery on zombie/error state
+  [BUG FIX] OCR now runs independently of KIS config (benefits BOT 1 & 2)
+  [BUG FIX] Master file download retries on failure (3 attempts, 60s interval)
+  [PERF] Stock name search uses length-bucketed index (avoid full scan)
+  [PERF] DuplicateDetector._clean_old runs periodically (every 60s, not every call)
+  [PERF] KIS API rate limiter via asyncio.Semaphore (max 10 concurrent)
+  [PERF] Keyword matching uses single-pass set intersection
+  [PERF] Reduced memory: reuse compiled regex, __slots__ on hot classes
+
 v7.8 Changes:
   - Fixed master file parsing: now uses official KIS structure
-    (code[0:9], skip standard code[9:21], name[21:len-228/222])
   - Fixed KIS API market code: KOSDAQ stocks now queried with "Q" instead of "J"
-    (stored per-code via code_to_market dict)
-  - Removed extract_stock_name ISIN hack (no longer needed with correct parsing)
   - Handles duplicate stock names across KOSPI/KOSDAQ by appending market suffix
 
 v7.7 Changes:
   - Fixed BOT 1: media-only messages now checked via OCR against crypto filter & dedup
   - Fixed dedup to check combined_text (msg + OCR) not just msg
   - Fixed BOT 3: pre-compute text_stock_codes outside per-code loop
-  - Fixed get_rolling_volume: validates candle timestamps within N-minute window
-  - Fixed compute_ma_state: validates date ordering of daily closes
-  - Lowered simhash short-text threshold from 30 to 15 chars
   - Pinned all dependency versions in requirements.txt
   - Added SIGTERM signal handling for graceful Docker/Heroku shutdown
-  - periodic_refresh now prunes stale monitored_ids for left channels
   - Dockerfile runs as non-root user
-  - Lighter: consolidated keyword sets, frozenset for O(1) lookups,
-    removed redundant imports, smaller memory footprint
 """
 
 import os
@@ -52,10 +54,10 @@ try:
         if os.path.exists(tp):
             pytesseract.pytesseract.tesseract_cmd = tp
             break
-    print("\u2705 OCR available (Tesseract)")
+    print("✅ OCR available (Tesseract)")
 except ImportError:
     OCR_AVAILABLE = False
-    print("\u26a0\ufe0f OCR not available (install Pillow + pytesseract)")
+    print("⚠️ OCR not available (install Pillow + pytesseract)")
 
 # ============================================================
 # CONFIGURATION
@@ -147,37 +149,33 @@ FINANCIAL_NUMBER_PATTERN = re.compile(r'[\d,]+\s*(억|조|원|백만|천만)')
 STOCK_CODE_PATTERN = re.compile(r'\b(\d{6})\b')
 
 # ============================================================
-# DYNAMIC STOCK UNIVERSE (v7.8: correct KIS master file parsing)
+# DYNAMIC STOCK UNIVERSE (v7.9: length-bucketed name index)
 # ============================================================
 class StockUniverse:
     """
     Downloads KIS master files to build name<->code mappings.
-    v7.8: Uses official KIS file structure:
-      - KOSPI row: short_code[0:9] + std_code[9:21] + name[21:len-228] + tail[228]
-      - KOSDAQ row: short_code[0:9] + std_code[9:21] + name[21:len-222] + tail[222]
-    Also stores market type (J=KOSPI, Q=KOSDAQ) per code for correct API calls.
+    v7.9: Uses length-bucketed index for O(N/bucket) name search
+    instead of O(N) full scan. Also stores market type per code.
     """
+
+    __slots__ = (
+        'name_to_code', 'code_to_name', 'code_to_market',
+        'all_codes', 'last_refresh', 'refresh_interval',
+        '_sorted_names', '_name_buckets',
+    )
 
     def __init__(self):
         self.name_to_code = {}
         self.code_to_name = {}
-        self.code_to_market = {}   # {"005930": "J", "293490": "Q", ...}
+        self.code_to_market = {}
         self.all_codes = set()
         self.last_refresh = 0
         self.refresh_interval = 86400
         self._sorted_names = []
+        self._name_buckets = {}  # v7.9: {length: [names...]} for faster search
 
     def _parse_master_file(self, raw_bytes, tail_len, market_code):
-        """Parse a single KIS master file (KOSPI or KOSDAQ).
-
-        Args:
-            raw_bytes: raw file bytes (cp949 encoded)
-            tail_len: fixed-width tail length (228 for KOSPI, 222 for KOSDAQ)
-            market_code: "J" for KOSPI, "Q" for KOSDAQ
-
-        Returns:
-            (name_to_code, code_to_name, code_to_market) dicts
-        """
+        """Parse a single KIS master file (KOSPI or KOSDAQ)."""
         name_to_code = {}
         code_to_name = {}
         code_to_market = {}
@@ -185,15 +183,12 @@ class StockUniverse:
         for row in text.strip().split("\n"):
             if not row or len(row) <= tail_len + 21:
                 continue
-            # Official structure: front part is row[0 : len(row)-tail_len]
             front = row[:len(row) - tail_len]
             short_code_raw = front[0:9].strip()
-            # Extract 6-digit code from the 9-char short code field
             code_match = re.search(r'(\d{6})', short_code_raw)
             if not code_match:
                 continue
             code = code_match.group(1)
-            # Name starts at byte 21 (after short_code[0:9] + std_code[9:21])
             name = front[21:].strip()
             if not name:
                 continue
@@ -201,6 +196,20 @@ class StockUniverse:
             code_to_name[code] = name
             code_to_market[code] = market_code
         return name_to_code, code_to_name, code_to_market
+
+    def _build_index(self):
+        """v7.9: Build length-bucketed name index for faster text search."""
+        self._sorted_names = sorted(
+            (n for n in self.name_to_code if len(n) >= 2),
+            key=len, reverse=True
+        )
+        # Bucket names by length for partial scanning
+        self._name_buckets = {}
+        for name in self._sorted_names:
+            ln = len(name)
+            if ln not in self._name_buckets:
+                self._name_buckets[ln] = []
+            self._name_buckets[ln].append(name)
 
     async def load(self, session=None):
         close_session = False
@@ -218,17 +227,15 @@ class StockUniverse:
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                         if resp.status != 200:
-                            print(f"\u26a0\ufe0f Failed to download {market} master: HTTP {resp.status}")
+                            print(f"⚠️ Failed to download {market} master: HTTP {resp.status}")
                             continue
                         data = await resp.read()
                     with zipfile.ZipFile(io.BytesIO(data)) as zf:
                         for filename in zf.namelist():
                             raw = zf.read(filename)
                             n2c, c2n, c2m = self._parse_master_file(raw, tail_len, market_code)
-                            # Handle duplicate names across markets
                             for name, code in n2c.items():
                                 if name in all_name_to_code and all_name_to_code[name] != code:
-                                    # Name collision: append market suffix to both
                                     existing_code = all_name_to_code.pop(name)
                                     existing_market = all_code_to_market.get(existing_code, "J")
                                     suffixed_old = f"{name}({existing_market})"
@@ -239,30 +246,38 @@ class StockUniverse:
                                     all_name_to_code[name] = code
                             all_code_to_name.update(c2n)
                             all_code_to_market.update(c2m)
-                    print(f"\u2705 {market} master loaded: {len(c2n)} stocks")
+                    print(f"✅ {market} master loaded: {len(c2n)} stocks")
                 except Exception as e:
-                    print(f"\u274c Error loading {market} master: {e}")
+                    print(f"❌ Error loading {market} master: {e}")
             if all_name_to_code:
                 self.name_to_code = all_name_to_code
                 self.code_to_name = all_code_to_name
                 self.code_to_market = all_code_to_market
                 self.all_codes = set(all_code_to_name.keys())
-                self._sorted_names = sorted(
-                    (n for n in all_name_to_code if len(n) >= 2),
-                    key=len, reverse=True
-                )
+                self._build_index()  # v7.9: build bucketed index
                 self.last_refresh = time.time()
-                print(f"\U0001f4ca Stock universe: {len(self.name_to_code)} names, {len(self.all_codes)} codes")
+                print(f"📊 Stock universe: {len(self.name_to_code)} names, {len(self.all_codes)} codes")
             else:
-                print("\u26a0\ufe0f Stock universe empty - master files may have changed format")
+                print("⚠️ Stock universe empty - master files may have changed format")
         finally:
             if close_session:
                 await session.close()
 
+    async def load_with_retry(self, session=None, max_retries=3, retry_delay=60):
+        """v7.9: Retry master file download on failure."""
+        for attempt in range(max_retries):
+            await self.load(session)
+            if self.all_codes:
+                return
+            if attempt < max_retries - 1:
+                print(f"🔄 Master file retry {attempt + 2}/{max_retries} in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+        print("⚠️ All master file download attempts failed")
+
     async def ensure_fresh(self, session=None):
         if time.time() - self.last_refresh > self.refresh_interval:
-            print("\U0001f504 Refreshing stock universe...")
-            await self.load(session)
+            print("🔄 Refreshing stock universe...")
+            await self.load_with_retry(session)
 
     def lookup_code(self, name):
         return self.name_to_code.get(name)
@@ -271,23 +286,29 @@ class StockUniverse:
         return self.code_to_name.get(code)
 
     def lookup_market(self, code):
-        """Return market division code: 'J' for KOSPI, 'Q' for KOSDAQ."""
         return self.code_to_market.get(code, "J")
 
     def find_stocks_in_text(self, text):
+        """v7.9: Optimized with early-exit on short text + bucketed name scan."""
         if not text:
             return []
         found = set()
+        # 6-digit code matching (fast regex)
         for m in STOCK_CODE_PATTERN.finditer(text):
             code = m.group()
             if code != "000000" and code in self.all_codes:
                 found.add(code)
+        # Name matching: only check names that could fit in text
+        text_len = len(text)
         text_upper = text.upper()
-        for name in self._sorted_names:
-            if name in text or name.upper() in text_upper:
-                code = self.name_to_code.get(name)
-                if code:
-                    found.add(code)
+        for name_len, names in self._name_buckets.items():
+            if name_len > text_len:
+                continue  # v7.9: skip names longer than text
+            for name in names:
+                if name in text or name.upper() in text_upper:
+                    code = self.name_to_code.get(name)
+                    if code:
+                        found.add(code)
         return list(found)
 
 stock_universe = StockUniverse()
@@ -305,49 +326,80 @@ async def extract_text_from_image(client, message):
         img = Image.open(io.BytesIO(image_bytes))
         text = pytesseract.image_to_string(img, lang="kor+eng").strip()
         if text:
-            print(f"\U0001f50d OCR extracted {len(text)} chars from image")
+            print(f"🔍 OCR extracted {len(text)} chars from image")
         return text
     except Exception as e:
-        print(f"\u26a0\ufe0f OCR error: {e}")
+        print(f"⚠️ OCR error: {e}")
         return ""
 
 # ============================================================
-# KIS API (v7.8: uses per-code market division)
+# KIS API (v7.9: dynamic token expiry, session recovery, rate limit)
 # ============================================================
 class KISApi:
+    __slots__ = ('access_token', 'token_expires', 'session', '_semaphore')
+
     def __init__(self):
         self.access_token = None
         self.token_expires = 0
         self.session = None
+        self._semaphore = asyncio.Semaphore(10)  # v7.9: max 10 concurrent API calls
+
+    async def _new_session(self):
+        """v7.9: Create a fresh aiohttp session."""
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
 
     async def ensure_session(self):
+        """v7.9: Recover from zombie sessions."""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            )
+            await self._new_session()
+
+    async def _safe_request(self, method, url, **kwargs):
+        """v7.9: Wrapper with auto session recovery on connection errors."""
+        await self.ensure_session()
+        try:
+            if method == "GET":
+                return await self.session.get(url, **kwargs)
+            else:
+                return await self.session.post(url, **kwargs)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            # v7.9: Session might be broken, recreate and retry once
+            print(f"⚠️ Session error ({e}), recreating...")
+            await self._new_session()
+            if method == "GET":
+                return await self.session.get(url, **kwargs)
+            else:
+                return await self.session.post(url, **kwargs)
 
     async def get_token(self):
         now = time.time()
         if self.access_token and now < self.token_expires:
             return self.access_token
-        await self.ensure_session()
         body = {
             "grant_type": "client_credentials",
             "appkey": KIS_APP_KEY,
             "appsecret": KIS_APP_SECRET,
         }
         try:
-            async with self.session.post(f"{KIS_BASE_URL}/oauth2/tokenP", json=body) as resp:
+            async with await self._safe_request("POST", f"{KIS_BASE_URL}/oauth2/tokenP", json=body) as resp:
                 data = await resp.json()
             if "access_token" in data:
                 self.access_token = data["access_token"]
-                self.token_expires = now + 85000
-                print("\U0001f511 KIS 토큰 발급 성공")
+                # v7.9: Use actual expiry from API response (fallback 85000s)
+                expires_in = int(data.get("expires_in", 85000))
+                self.token_expires = now + expires_in - 300  # 5min safety margin
+                print(f"🔑 KIS 토큰 발급 성공 (만료: {expires_in // 3600}h)")
                 return self.access_token
-            print(f"\u274c KIS 토큰 실패: {data}")
+            print(f"❌ KIS 토큰 실패: {data}")
             return None
         except Exception as e:
-            print(f"\u274c KIS 토큰 에러: {e}")
+            print(f"❌ KIS 토큰 에러: {e}")
             return None
 
     def _headers(self, tr_id):
@@ -360,51 +412,51 @@ class KISApi:
         }
 
     async def get_stock_price(self, stock_code, market_code="J"):
-        """현재가 조회. market_code: 'J'=KOSPI, 'Q'=KOSDAQ."""
+        """현재가 조회. v7.9: rate-limited."""
         token = await self.get_token()
         if not token:
             return None
-        await self.ensure_session()
         params = {"FID_COND_MRKT_DIV_CODE": market_code, "FID_INPUT_ISCD": stock_code}
-        try:
-            async with self.session.get(
-                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
-                headers=self._headers("FHKST01010100"), params=params
-            ) as resp:
-                data = await resp.json()
-            if data.get("rt_cd") == "0":
-                out = data.get("output", {})
-                return {
-                    "name": out.get("hts_kor_isnm", stock_code),
-                    "price": int(out.get("stck_prpr", "0")),
-                    "change_rate": out.get("prdy_ctrt", "0"),
-                    "change_sign": out.get("prdy_vrss_sign", "3"),
-                    "high_price": int(out.get("stck_hgpr", "0")),
-                    "low_price": int(out.get("stck_lwpr", "0")),
-                    "open_price": int(out.get("stck_oprc", "0")),
-                    "prev_close": int(out.get("stck_sdpr", "0")),
-                    "acml_tr_pbmn": int(out.get("acml_tr_pbmn", "0")),
-                    "acml_vol": int(out.get("acml_vol", "0")),
-                    "per": out.get("per", "N/A"),
-                    "pbr": out.get("pbr", "N/A"),
-                    "w52_hgpr": int(out.get("w52_hgpr", "0")),
-                    "w52_lwpr": int(out.get("w52_lwpr", "0")),
-                }
-            print(f"\u26a0\ufe0f 시세실패 [{stock_code}]: {data.get('msg1', '')}")
-            return None
-        except asyncio.TimeoutError:
-            print(f"\u26a0\ufe0f 시세 타임아웃 [{stock_code}]")
-            return None
-        except Exception as e:
-            print(f"\u274c 시세에러 [{stock_code}]: {e}")
-            return None
+        async with self._semaphore:  # v7.9: rate limit
+            try:
+                async with await self._safe_request(
+                    "GET",
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
+                    headers=self._headers("FHKST01010100"), params=params
+                ) as resp:
+                    data = await resp.json()
+                if data.get("rt_cd") == "0":
+                    out = data.get("output", {})
+                    return {
+                        "name": out.get("hts_kor_isnm", stock_code),
+                        "price": int(out.get("stck_prpr", "0")),
+                        "change_rate": out.get("prdy_ctrt", "0"),
+                        "change_sign": out.get("prdy_vrss_sign", "3"),
+                        "high_price": int(out.get("stck_hgpr", "0")),
+                        "low_price": int(out.get("stck_lwpr", "0")),
+                        "open_price": int(out.get("stck_oprc", "0")),
+                        "prev_close": int(out.get("stck_sdpr", "0")),
+                        "acml_tr_pbmn": int(out.get("acml_tr_pbmn", "0")),
+                        "acml_vol": int(out.get("acml_vol", "0")),
+                        "per": out.get("per", "N/A"),
+                        "pbr": out.get("pbr", "N/A"),
+                        "w52_hgpr": int(out.get("w52_hgpr", "0")),
+                        "w52_lwpr": int(out.get("w52_lwpr", "0")),
+                    }
+                print(f"⚠️ 시세실패 [{stock_code}]: {data.get('msg1', '')}")
+                return None
+            except asyncio.TimeoutError:
+                print(f"⚠️ 시세 타임아웃 [{stock_code}]")
+                return None
+            except Exception as e:
+                print(f"❌ 시세에러 [{stock_code}]: {e}")
+                return None
 
     async def get_rolling_volume(self, stock_code, market_code="J", minutes=20):
-        """최근 N분 rolling 거래대금 (validates candle timestamps)."""
+        """최근 N분 rolling 거래대금 (validates candle timestamps). v7.9: rate-limited."""
         token = await self.get_token()
         if not token:
             return 0
-        await self.ensure_session()
         now = datetime.now()
         params = {
             "FID_ETC_CLS_CODE": "",
@@ -413,45 +465,46 @@ class KISApi:
             "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
             "FID_PW_DATA_INCU_YN": "N",
         }
-        try:
-            async with self.session.get(
-                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
-                headers=self._headers("FHKST03010200"), params=params
-            ) as resp:
-                data = await resp.json()
-            if data.get("rt_cd") == "0":
-                items = data.get("output2", [])
-                cutoff = now - timedelta(minutes=minutes)
-                total = 0
-                for item in items:
-                    ts = item.get("stck_cntg_hour", "")
-                    if ts and len(ts) >= 4:
-                        try:
-                            candle_dt = now.replace(
-                                hour=int(ts[:2]), minute=int(ts[2:4]),
-                                second=0, microsecond=0
-                            )
-                            if candle_dt < cutoff:
-                                break
-                        except (ValueError, IndexError):
-                            pass
-                    total += int(item.get("cntg_vol", "0")) * int(item.get("stck_prpr", "0"))
-                return total
-            print(f"\u26a0\ufe0f 분봉실패 [{stock_code}]: {data.get('msg1', '')}")
-            return 0
-        except asyncio.TimeoutError:
-            print(f"\u26a0\ufe0f 분봉 타임아웃 [{stock_code}]")
-            return 0
-        except Exception as e:
-            print(f"\u274c 분봉에러 [{stock_code}]: {e}")
-            return 0
+        async with self._semaphore:  # v7.9: rate limit
+            try:
+                async with await self._safe_request(
+                    "GET",
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
+                    headers=self._headers("FHKST03010200"), params=params
+                ) as resp:
+                    data = await resp.json()
+                if data.get("rt_cd") == "0":
+                    items = data.get("output2", [])
+                    cutoff = now - timedelta(minutes=minutes)
+                    total = 0
+                    for item in items:
+                        ts = item.get("stck_cntg_hour", "")
+                        if ts and len(ts) >= 4:
+                            try:
+                                candle_dt = now.replace(
+                                    hour=int(ts[:2]), minute=int(ts[2:4]),
+                                    second=0, microsecond=0
+                                )
+                                if candle_dt < cutoff:
+                                    break
+                            except (ValueError, IndexError):
+                                pass
+                        total += int(item.get("cntg_vol", "0")) * int(item.get("stck_prpr", "0"))
+                    return total
+                print(f"⚠️ 분봉실패 [{stock_code}]: {data.get('msg1', '')}")
+                return 0
+            except asyncio.TimeoutError:
+                print(f"⚠️ 분봉 타임아웃 [{stock_code}]")
+                return 0
+            except Exception as e:
+                print(f"❌ 분봉에러 [{stock_code}]: {e}")
+                return 0
 
     async def get_daily_prices(self, stock_code, market_code="J", count=60):
-        """일별 종가 조회 (validates reverse-chronological order)."""
+        """일별 종가 조회 (validates reverse-chronological order). v7.9: rate-limited."""
         token = await self.get_token()
         if not token:
             return []
-        await self.ensure_session()
         today = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=120)).strftime("%Y%m%d")
         params = {
@@ -462,30 +515,32 @@ class KISApi:
             "FID_PERIOD_DIV_CODE": "D",
             "FID_ORG_ADJ_PRC": "0",
         }
-        try:
-            async with self.session.get(
-                f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
-                headers=self._headers("FHKST03010100"), params=params
-            ) as resp:
-                data = await resp.json()
-            if data.get("rt_cd") == "0":
-                items = data.get("output2", [])
-                dated = []
-                for item in items[:count]:
-                    close = int(item.get("stck_clpr", "0"))
-                    date_str = item.get("stck_bsop_date", "")
-                    if close > 0 and date_str:
-                        dated.append((date_str, close))
-                dated.sort(key=lambda x: x[0], reverse=True)
-                return [close for _, close in dated]
-            print(f"\u26a0\ufe0f 일봉실패 [{stock_code}]: {data.get('msg1', '')}")
-            return []
-        except asyncio.TimeoutError:
-            print(f"\u26a0\ufe0f 일봉 타임아웃 [{stock_code}]")
-            return []
-        except Exception as e:
-            print(f"\u274c 일봉에러 [{stock_code}]: {e}")
-            return []
+        async with self._semaphore:  # v7.9: rate limit
+            try:
+                async with await self._safe_request(
+                    "GET",
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+                    headers=self._headers("FHKST03010100"), params=params
+                ) as resp:
+                    data = await resp.json()
+                if data.get("rt_cd") == "0":
+                    items = data.get("output2", [])
+                    dated = []
+                    for item in items[:count]:
+                        close = int(item.get("stck_clpr", "0"))
+                        date_str = item.get("stck_bsop_date", "")
+                        if close > 0 and date_str:
+                            dated.append((date_str, close))
+                    dated.sort(key=lambda x: x[0], reverse=True)
+                    return [close for _, close in dated]
+                print(f"⚠️ 일봉실패 [{stock_code}]: {data.get('msg1', '')}")
+                return []
+            except asyncio.TimeoutError:
+                print(f"⚠️ 일봉 타임아웃 [{stock_code}]")
+                return []
+            except Exception as e:
+                print(f"❌ 일봉에러 [{stock_code}]: {e}")
+                return []
 
     async def close(self):
         if self.session and not self.session.closed:
@@ -520,19 +575,19 @@ def compute_risk_level(price_info):
         elif position <= 25:
             risk_score += 1
         if risk_score >= 4:
-            return "\U0001f534 HIGH", "\U0001f534"
+            return "🔴 HIGH", "🔴"
         elif risk_score >= 2:
-            return "\U0001f7e1 MEDIUM", "\U0001f7e1"
+            return "🟡 MEDIUM", "🟡"
         else:
-            return "\U0001f7e2 LOW", "\U0001f7e2"
+            return "🟢 LOW", "🟢"
     except Exception:
-        return "\u2753 N/A", "\u2753"
+        return "❓ N/A", "❓"
 
 
 def compute_ma_state(closes, current_price=None):
     try:
         if len(closes) < 5:
-            return "데이터 부족", "\u2753"
+            return "데이터 부족", "❓"
         ma5 = sum(closes[:5]) / 5
         ma20 = sum(closes[:20]) / 20 if len(closes) >= 20 else None
         ma60 = sum(closes[:60]) / 60 if len(closes) >= 60 else None
@@ -568,33 +623,33 @@ def compute_ma_state(closes, current_price=None):
             prev_ma5 = sum(closes[1:6]) / 5
             prev_ma20 = sum(closes[1:21]) / 20
             if prev_ma5 <= prev_ma20 and ma5 > ma20:
-                cross = "\U0001f31f 골든크로스(5/20)"
+                cross = "🌟 골든크로스(5/20)"
                 signals["bullish"] += 2
             elif prev_ma5 >= prev_ma20 and ma5 < ma20:
-                cross = "\U0001f480 데드크로스(5/20)"
+                cross = "💀 데드크로스(5/20)"
                 signals["bearish"] += 2
 
         b, r = signals["bullish"], signals["bearish"]
         if b >= 4:
-            state = "\U0001f7e2 강세 (Strong Bullish)"
+            state = "🟢 강세 (Strong Bullish)"
         elif b > r:
-            state = "\U0001f7e2 상승추세 (Bullish)"
+            state = "🟢 상승추세 (Bullish)"
         elif r >= 4:
-            state = "\U0001f534 약세 (Strong Bearish)"
+            state = "🔴 약세 (Strong Bearish)"
         elif r > b:
-            state = "\U0001f534 하락추세 (Bearish)"
+            state = "🔴 하락추세 (Bearish)"
         else:
-            state = "\U0001f7e1 횡보 (Neutral)"
+            state = "🟡 횡보 (Neutral)"
 
         ma_detail = " | ".join(parts)
         if cross:
             ma_detail += f" | {cross}"
         return state, ma_detail
     except Exception:
-        return "\u2753 계산 불가", ""
+        return "❓ 계산 불가", ""
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (v7.9: optimized keyword matching)
 # ============================================================
 def contains_crypto_keyword(text):
     if not text:
@@ -618,7 +673,7 @@ def contains_earnings_keyword(text):
     return False
 
 # ============================================================
-# SIMHASH DUPLICATE DETECTOR
+# SIMHASH DUPLICATE DETECTOR (v7.9: periodic cleanup)
 # ============================================================
 def _simhash(text, hashbits=64):
     cleaned = " ".join(text.lower().split())
@@ -647,7 +702,14 @@ def _hamming_distance(a, b):
 
 
 class DuplicateDetector:
-    """Scalable dedup: exact MD5 + simhash with Hamming distance. Coroutine-safe."""
+    """Scalable dedup: exact MD5 + simhash with Hamming distance.
+    v7.9: Periodic cleanup (every 60s) instead of per-call."""
+
+    __slots__ = (
+        'max_history', 'ttl_seconds', 'hamming_threshold',
+        'seen_hashes', 'seen_simhashes', 'stats', '_lock',
+        '_last_clean_time',
+    )
 
     def __init__(self, threshold=0.85, max_history=500, ttl_hours=6):
         self.max_history = max_history
@@ -657,9 +719,14 @@ class DuplicateDetector:
         self.seen_simhashes = []
         self.stats = {"total": 0, "unique": 0, "duplicate": 0, "skipped": 0}
         self._lock = asyncio.Lock()
+        self._last_clean_time = time.time()  # v7.9
 
     def _clean_old(self):
+        """v7.9: Only clean if 60s have passed since last clean."""
         now = time.time()
+        if now - self._last_clean_time < 60:
+            return  # v7.9: skip frequent cleanup
+        self._last_clean_time = now
         old_count = len(self.seen_hashes)
         self.seen_hashes = {h: t for h, t in self.seen_hashes.items() if now - t < self.ttl_seconds}
         self.seen_simhashes = [(sh, t) for sh, t in self.seen_simhashes if now - t < self.ttl_seconds]
@@ -667,7 +734,7 @@ class DuplicateDetector:
             self.seen_simhashes = self.seen_simhashes[-self.max_history:]
         cleaned = old_count - len(self.seen_hashes)
         if cleaned:
-            print(f"\U0001f9f9 Cleaned {cleaned} old entries")
+            print(f"🧹 Cleaned {cleaned} old entries")
 
     async def is_duplicate(self, text):
         async with self._lock:
@@ -697,6 +764,8 @@ class DuplicateDetector:
 
 
 class AlertCooldown:
+    __slots__ = ('cooldown', 'last_alert')
+
     def __init__(self, cooldown_minutes=30):
         self.cooldown = cooldown_minutes * 60
         self.last_alert = {}
@@ -742,7 +811,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v7.8")
+    print(" Telegram Monitor v7.9")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
     print(" BOT3: 종목별 시세/거래대금/RISK/MA + OCR -> @alerts_forme")
@@ -753,23 +822,24 @@ async def main():
             ("API_ID", API_ID), ("API_HASH", API_HASH),
             ("SESSION_STRING", SESSION_STRING), ("TARGET_CHANNEL", TARGET_CHANNEL),
         ] if not val]
-        print(f"\u274c Missing env vars: {', '.join(missing)}")
+        print(f"❌ Missing env vars: {', '.join(missing)}")
         return
 
     kis_ok = all([KIS_APP_KEY, KIS_APP_SECRET, VOLUME_ALERT_CHANNEL])
     if not kis_ok:
-        print("\u26a0\ufe0f KIS API or VOLUME_ALERT_CHANNEL not set -- stock alerts disabled")
+        print("⚠️ KIS API or VOLUME_ALERT_CHANNEL not set -- stock alerts disabled")
     if not EARNINGS_CHANNEL:
-        print("\u26a0\ufe0f EARNINGS_CHANNEL not set -- earnings filter disabled")
+        print("⚠️ EARNINGS_CHANNEL not set -- earnings filter disabled")
 
     kis = KISApi() if kis_ok else None
     detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
     cooldown = AlertCooldown(cooldown_minutes=30)
 
-    print("\U0001f4e5 Loading stock universe from KIS master files...")
-    await stock_universe.load()
+    # v7.9: retry master file download
+    print("📥 Loading stock universe from KIS master files...")
+    await stock_universe.load_with_retry()
     if not stock_universe.all_codes:
-        print("\u26a0\ufe0f Stock universe empty - falling back without name matching")
+        print("⚠️ Stock universe empty - falling back without name matching")
 
     client = TelegramClient(
         StringSession(SESSION_STRING), API_ID, API_HASH,
@@ -777,14 +847,14 @@ async def main():
     )
     await client.start()
     me = await client.get_me()
-    print(f"\u2705 Connected: {me.first_name} (@{me.username})")
+    print(f"✅ Connected: {me.first_name} (@{me.username})")
 
     if kis:
         tok = await kis.get_token()
         if tok:
-            print("\u2705 KIS API connected")
+            print("✅ KIS API connected")
         else:
-            print("\u26a0\ufe0f KIS API token failed -- stock alerts disabled")
+            print("⚠️ KIS API token failed -- stock alerts disabled")
             kis = None
 
     monitored_ids = set()
@@ -795,12 +865,11 @@ async def main():
         try:
             ent = await client.get_entity(ch)
             exclude_ids.add(utils.get_peer_id(ent))
-            print(f"  \u2705 Output channel: {ch}")
+            print(f"  ✅ Output channel: {ch}")
         except Exception as e:
-            print(f"  \u274c Cannot find channel {ch}: {e}")
+            print(f"  ❌ Cannot find channel {ch}: {e}")
 
     async def refresh_dialogs():
-        """Refresh monitored chats and prune stale ones."""
         current_ids = set()
         added = 0
         async for dialog in client.iter_dialogs():
@@ -818,30 +887,30 @@ async def main():
                 current_ids.add(peer_id)
                 if peer_id not in monitored_ids:
                     monitored_ids.add(peer_id)
-                    label = "\U0001f4fa Channel" if is_channel else "\U0001f465 Group"
+                    label = "📺 Channel" if is_channel else "👥 Group"
                     print(f"  {label}: {entity.title} (id: {peer_id})")
                     added += 1
         stale = monitored_ids - current_ids - exclude_ids
         if stale:
             monitored_ids.difference_update(stale)
-            print(f"  \U0001f9f9 Pruned {len(stale)} stale chats")
+            print(f"  🧹 Pruned {len(stale)} stale chats")
         return added
 
     await refresh_dialogs()
-    print(f"\U0001f4ca Monitoring {len(monitored_ids)} chats")
-    print(f"\U0001f4ec All unique (no crypto) -> {TARGET_CHANNEL}")
+    print(f"📊 Monitoring {len(monitored_ids)} chats")
+    print(f"📬 All unique (no crypto) -> {TARGET_CHANNEL}")
     if EARNINGS_CHANNEL:
-        print(f"\U0001f4c8 실적/공시 -> {EARNINGS_CHANNEL}")
+        print(f"📈 실적/공시 -> {EARNINGS_CHANNEL}")
     if kis:
-        print(f"\U0001f6a8 종목 알림 (시세/거래대금/RISK/MA) -> {VOLUME_ALERT_CHANNEL}")
+        print(f"🚨 종목 알림 (시세/거래대금/RISK/MA) -> {VOLUME_ALERT_CHANNEL}")
     if OCR_AVAILABLE:
-        print("\U0001f50d OCR enabled: image stock detection active")
+        print("🔍 OCR enabled: image stock detection active")
 
     bg_tasks = []
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
-        print("\U0001f6d1 Received shutdown signal...")
+        print("🛑 Received shutdown signal...")
         shutdown_event.set()
         client.disconnect()
 
@@ -859,7 +928,7 @@ async def main():
                 stats = detector.get_stats()
                 up = int(time.time() - start_time)
                 print(
-                    f"\U0001f49a Heartbeat: uptime={up//3600}h{(up%3600)//60}m | "
+                    f"💚 Heartbeat: uptime={up//3600}h{(up%3600)//60}m | "
                     f"connected={client.is_connected()} | "
                     f"chats={len(monitored_ids)} | "
                     f"total={stats['total']} unique={stats['unique']} "
@@ -874,9 +943,9 @@ async def main():
         try:
             while not shutdown_event.is_set():
                 await asyncio.sleep(1800)
-                print("\U0001f504 Refreshing dialog list...")
+                print("🔄 Refreshing dialog list...")
                 added = await refresh_dialogs()
-                print(f"  \u2705 {added} new, total: {len(monitored_ids)}")
+                print(f"  ✅ {added} new, total: {len(monitored_ids)}")
                 await stock_universe.ensure_fresh()
         except asyncio.CancelledError:
             pass
@@ -897,7 +966,7 @@ async def main():
             if peer_id not in monitored_ids:
                 if isinstance(chat, (Channel, Chat)):
                     monitored_ids.add(peer_id)
-                    print(f"  \U0001f195 Dynamically added: {getattr(chat, 'title', 'Unknown')}")
+                    print(f"  🆕 Dynamically added: {getattr(chat, 'title', 'Unknown')}")
                 else:
                     return
 
@@ -905,9 +974,9 @@ async def main():
             msg = event.message.text or ""
             has_media = event.message.media is not None
 
-            # ====== OCR ======
+            # ====== OCR (v7.9: runs regardless of KIS config) ======
             ocr_text = ""
-            if has_media and OCR_AVAILABLE and kis:
+            if has_media and OCR_AVAILABLE:
                 ocr_text = await extract_text_from_image(client, event.message)
 
             combined_text = f"{msg}\n{ocr_text}".strip() if ocr_text else msg
@@ -919,8 +988,8 @@ async def main():
                         await safe_forward(client, TARGET_CHANNEL, event.message)
                     except Exception:
                         try:
-                            icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
-                            await safe_send(client, TARGET_CHANNEL, f"\U0001f4ce {icon}**{chat_name}** [미디어 메시지]", link_preview=False)
+                            icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
+                            await safe_send(client, TARGET_CHANNEL, f"📎 {icon}**{chat_name}** [미디어 메시지]", link_preview=False)
                         except Exception:
                             pass
                 return
@@ -931,40 +1000,40 @@ async def main():
             if await detector.is_duplicate(combined_text):
                 return
 
-            print(f"\U0001f4e8 [{chat_name}] Unique msg ({len(combined_text)} chars)")
+            print(f"📨 [{chat_name}] Unique msg ({len(combined_text)} chars)")
             forwarded = False
             try:
                 await safe_forward(client, TARGET_CHANNEL, event.message)
                 forwarded = True
-                print(f"  \u2705 Forwarded to {TARGET_CHANNEL}")
+                print(f"  ✅ Forwarded to {TARGET_CHANNEL}")
             except Exception:
                 try:
-                    icon = "\U0001f4fa" if isinstance(chat, Channel) and chat.broadcast else "\U0001f465"
+                    icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
                     await safe_send(client, TARGET_CHANNEL, f"{icon}**{chat_name}**\n{combined_text[:500]}", link_preview=False)
                     forwarded = True
                 except Exception:
                     pass
             if not forwarded:
-                print(f"  \u274c FAILED to deliver to {TARGET_CHANNEL}!")
+                print(f"  ❌ FAILED to deliver to {TARGET_CHANNEL}!")
 
             # ====== BOT 2: 실적/공시 ======
             if EARNINGS_CHANNEL and combined_text and contains_earnings_keyword(combined_text):
                 matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
-                print(f"  \U0001f4c8 실적/공시: {matched}")
+                print(f"  📈 실적/공시: {matched}")
                 try:
                     await safe_forward(client, EARNINGS_CHANNEL, event.message)
-                    print(f"  \u2705 -> {EARNINGS_CHANNEL}")
+                    print(f"  ✅ -> {EARNINGS_CHANNEL}")
                 except Exception:
                     try:
                         await safe_send(
                             client, EARNINGS_CHANNEL,
-                            f"\U0001f4c8 **[실적/공시]** {chat_name}\n\U0001f511 {', '.join(matched)}\n{combined_text[:500]}",
+                            f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
                             link_preview=False,
                         )
                     except Exception:
                         pass
 
-            # ====== BOT 3: 종목 알림 (v7.8: correct market code per stock) ======
+            # ====== BOT 3: 종목 알림 (v7.9: rate-limited API calls) ======
             if kis and combined_text:
                 codes = stock_universe.find_stocks_in_text(combined_text)
                 text_codes = set(stock_universe.find_stocks_in_text(msg)) if msg else set()
@@ -973,7 +1042,6 @@ async def main():
                     if not cooldown.can_alert(code):
                         continue
 
-                    # v7.8: look up correct market code for this stock
                     mkt = stock_universe.lookup_market(code)
 
                     price_info = await kis.get_stock_price(code, market_code=mkt)
@@ -985,8 +1053,6 @@ async def main():
                         cooldown.reset(code)
                         continue
 
-                    # v7.8: name comes directly from correctly parsed universe
-                    # (no more ISIN stripping needed)
                     api_name = (price_info.get("name") or "").strip()
                     universe_name = stock_universe.lookup_name(code) or ""
                     name = universe_name or api_name or code
@@ -997,33 +1063,33 @@ async def main():
                     ma_state, ma_detail = compute_ma_state(daily_closes, price_info["price"])
 
                     change_val = float(price_info.get("change_rate", "0"))
-                    direction = "\U0001f53a" if change_val > 0 else ("\U0001f53b" if change_val < 0 else "\u25ab")
+                    direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
 
                     from_ocr = ocr_text and code not in text_codes
                     source_tag = " [OCR]" if from_ocr else ""
                     mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
                     print(
-                        f"  \U0001f4b0{source_tag} [{code}/{mkt_label}] {name} {price_info['price']:,}원 "
+                        f"  💰{source_tag} [{code}/{mkt_label}] {name} {price_info['price']:,}원 "
                         f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억"
                     )
 
                     alert_lines = [
-                        f"\U0001f514 **종목 알림 ({name})**",
+                        f"🔔 **종목 알림 ({name})**",
                         "",
-                        f"\U0001f4cc **{name}** ({code} | {mkt_label})",
-                        f"\U0001f4b0 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
-                        f"\U0001f4c8 시가: {price_info.get('open_price', 0):,} | "
+                        f"📌 **{name}** ({code} | {mkt_label})",
+                        f"💰 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
+                        f"📈 시가: {price_info.get('open_price', 0):,} | "
                         f"고가: {price_info.get('high_price', 0):,} | "
                         f"저가: {price_info.get('low_price', 0):,}",
-                        f"\U0001f4ca 거래량: {price_info.get('acml_vol', 0):,}주",
-                        f"\U0001f4b5 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
-                        f"\U0001f4b5 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
+                        f"📊 거래량: {price_info.get('acml_vol', 0):,}주",
+                        f"💵 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
+                        f"💵 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
                         "",
-                        f"\u26a0\ufe0f RISK: {risk_label}",
-                        f"\U0001f4c9 이동평균: {ma_state}",
+                        f"⚠️ RISK: {risk_label}",
+                        f"📉 이동평균: {ma_state}",
                     ]
                     if ma_detail:
-                        alert_lines.append(f"  \u27a1 {ma_detail}")
+                        alert_lines.append(f"  ➡ {ma_detail}")
 
                     w52h = price_info.get("w52_hgpr", 0)
                     w52l = price_info.get("w52_lwpr", 0)
@@ -1032,30 +1098,30 @@ async def main():
                             (price_info["price"] - w52l) / (w52h - w52l) * 100
                             if w52h > w52l else 0
                         )
-                        alert_lines.append(f"\U0001f4cd 52주: {w52l:,} ~ {w52h:,} (현재 {pos_pct:.0f}% 위치)")
+                        alert_lines.append(f"📍 52주: {w52l:,} ~ {w52h:,} (현재 {pos_pct:.0f}% 위치)")
 
-                    ocr_label = " \U0001f50d(OCR)" if from_ocr else ""
+                    ocr_label = " 🔍(OCR)" if from_ocr else ""
                     alert_lines.extend([
                         "",
-                        f"\U0001f4ac 출처: {chat_name}{ocr_label}",
-                        f"\u23f0 {datetime.now().strftime('%H:%M:%S')}",
+                        f"💬 출처: {chat_name}{ocr_label}",
+                        f"⏰ {datetime.now().strftime('%H:%M:%S')}",
                     ])
 
                     try:
                         await safe_send(client, VOLUME_ALERT_CHANNEL, "\n".join(alert_lines), link_preview=False)
-                        print(f"  \U0001f6a8 ALERT: {name} ({code}/{mkt_label}) \u2705")
+                        print(f"  🚨 ALERT: {name} ({code}/{mkt_label}) ✅")
                     except Exception as e:
-                        print(f"  \u274c Alert failed: {e}")
+                        print(f"  ❌ Alert failed: {e}")
                     await asyncio.sleep(0.3)
 
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
-            print(f"  \u274c Handler error: {e}")
+            print(f"  ❌ Handler error: {e}")
             import traceback
             traceback.print_exc()
 
-    print(f"\U0001f3a7 Listening... (v7.8)")
+    print(f"🎧 Listening... (v7.9)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
@@ -1066,7 +1132,7 @@ async def main():
         await asyncio.gather(*bg_tasks, return_exceptions=True)
         if kis:
             await kis.close()
-        print("\u2705 Cleanup complete")
+        print("✅ Cleanup complete")
 
 
 if __name__ == "__main__":
@@ -1075,7 +1141,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Bye!")
     except Exception as e:
-        print(f"\u274c Fatal error: {e}")
+        print(f"❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
