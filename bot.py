@@ -1,9 +1,21 @@
 """
-Telegram Channel & Group Monitor v7.9
+Telegram Channel & Group Monitor v8.0
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v8.0 Changes:
+  [BUG FIX] Signal handler now properly schedules async disconnect (was sync call)
+  [BUG FIX] KIS API int() conversions now validate data before parsing (crash prevention)
+  [BUG FIX] safe_forward/safe_send return False on final retry instead of raising
+  [BUG FIX] AlertCooldown now cleans old entries periodically (memory leak fix)
+  [BUG FIX] find_stocks_in_text returns deduplicated set (was list with possible dupes)
+  [BUG FIX] Empty/None chat titles now default to "Unknown"
+  [IMPROVE] OCR error logging now includes chat name context
+  [IMPROVE] Master file retry uses exponential backoff (60s, 120s, 240s)
+  [IMPROVE] Removed dead code: unused _sorted_names in StockUniverse
+  [IMPROVE] _hamming_distance uses Python 3.10+ int.bit_count() when available
 
 v7.9 Changes:
   [BUG FIX] KIS token expiry now uses API response expires_in (was hardcoded 85000s)
@@ -161,7 +173,7 @@ class StockUniverse:
     __slots__ = (
         'name_to_code', 'code_to_name', 'code_to_market',
         'all_codes', 'last_refresh', 'refresh_interval',
-        '_sorted_names', '_name_buckets',
+        '_name_buckets',
     )
 
     def __init__(self):
@@ -171,7 +183,6 @@ class StockUniverse:
         self.all_codes = set()
         self.last_refresh = 0
         self.refresh_interval = 86400
-        self._sorted_names = []
         self._name_buckets = {}  # v7.9: {length: [names...]} for faster search
 
     def _parse_master_file(self, raw_bytes, tail_len, market_code):
@@ -198,14 +209,12 @@ class StockUniverse:
         return name_to_code, code_to_name, code_to_market
 
     def _build_index(self):
-        """v7.9: Build length-bucketed name index for faster text search."""
-        self._sorted_names = sorted(
-            (n for n in self.name_to_code if len(n) >= 2),
-            key=len, reverse=True
-        )
-        # Bucket names by length for partial scanning
+        """v7.9: Build length-bucketed name index for faster text search.
+        v8.0: Removed unused _sorted_names."""
         self._name_buckets = {}
-        for name in self._sorted_names:
+        for name in self.name_to_code:
+            if len(name) < 2:
+                continue
             ln = len(name)
             if ln not in self._name_buckets:
                 self._name_buckets[ln] = []
@@ -264,14 +273,16 @@ class StockUniverse:
                 await session.close()
 
     async def load_with_retry(self, session=None, max_retries=3, retry_delay=60):
-        """v7.9: Retry master file download on failure."""
+        """v7.9: Retry master file download on failure.
+        v8.0: Exponential backoff (60s, 120s, 240s...)."""
         for attempt in range(max_retries):
             await self.load(session)
             if self.all_codes:
                 return
             if attempt < max_retries - 1:
-                print(f"🔄 Master file retry {attempt + 2}/{max_retries} in {retry_delay}s...")
-                await asyncio.sleep(retry_delay)
+                delay = retry_delay * (2 ** attempt)  # v8.0: exponential backoff
+                print(f"🔄 Master file retry {attempt + 2}/{max_retries} in {delay}s...")
+                await asyncio.sleep(delay)
         print("⚠️ All master file download attempts failed")
 
     async def ensure_fresh(self, session=None):
@@ -316,7 +327,8 @@ stock_universe = StockUniverse()
 # ============================================================
 # OCR
 # ============================================================
-async def extract_text_from_image(client, message):
+async def extract_text_from_image(client, message, chat_name=""):
+    """v8.0: Added chat_name param for better error logging."""
     if not OCR_AVAILABLE or not message.media:
         return ""
     try:
@@ -329,7 +341,8 @@ async def extract_text_from_image(client, message):
             print(f"🔍 OCR extracted {len(text)} chars from image")
         return text
     except Exception as e:
-        print(f"⚠️ OCR error: {e}")
+        ctx = f" [{chat_name}]" if chat_name else ""
+        print(f"⚠️ OCR error{ctx} (msg_id={message.id}): {e}")
         return ""
 
 # ============================================================
@@ -411,8 +424,18 @@ class KISApi:
             "Content-Type": "application/json; charset=utf-8",
         }
 
+    @staticmethod
+    def _safe_int(val, default=0):
+        """v8.0: Safely convert API string to int without crashing."""
+        if val is None:
+            return default
+        try:
+            return int(str(val).replace(",", "").strip())
+        except (ValueError, TypeError):
+            return default
+
     async def get_stock_price(self, stock_code, market_code="J"):
-        """현재가 조회. v7.9: rate-limited."""
+        """현재가 조회. v7.9: rate-limited. v8.0: safe int parsing."""
         token = await self.get_token()
         if not token:
             return None
@@ -427,21 +450,28 @@ class KISApi:
                     data = await resp.json()
                 if data.get("rt_cd") == "0":
                     out = data.get("output", {})
+                    if not out:
+                        print(f"⚠️ 시세 응답 비어있음 [{stock_code}]")
+                        return None
+                    price = self._safe_int(out.get("stck_prpr"))
+                    if price <= 0:
+                        print(f"⚠️ 시세 price=0 [{stock_code}], skipping alert")
+                        return None
                     return {
                         "name": out.get("hts_kor_isnm", stock_code),
-                        "price": int(out.get("stck_prpr", "0")),
+                        "price": price,
                         "change_rate": out.get("prdy_ctrt", "0"),
                         "change_sign": out.get("prdy_vrss_sign", "3"),
-                        "high_price": int(out.get("stck_hgpr", "0")),
-                        "low_price": int(out.get("stck_lwpr", "0")),
-                        "open_price": int(out.get("stck_oprc", "0")),
-                        "prev_close": int(out.get("stck_sdpr", "0")),
-                        "acml_tr_pbmn": int(out.get("acml_tr_pbmn", "0")),
-                        "acml_vol": int(out.get("acml_vol", "0")),
+                        "high_price": self._safe_int(out.get("stck_hgpr")),
+                        "low_price": self._safe_int(out.get("stck_lwpr")),
+                        "open_price": self._safe_int(out.get("stck_oprc")),
+                        "prev_close": self._safe_int(out.get("stck_sdpr")),
+                        "acml_tr_pbmn": self._safe_int(out.get("acml_tr_pbmn")),
+                        "acml_vol": self._safe_int(out.get("acml_vol")),
                         "per": out.get("per", "N/A"),
                         "pbr": out.get("pbr", "N/A"),
-                        "w52_hgpr": int(out.get("w52_hgpr", "0")),
-                        "w52_lwpr": int(out.get("w52_lwpr", "0")),
+                        "w52_hgpr": self._safe_int(out.get("w52_hgpr")),
+                        "w52_lwpr": self._safe_int(out.get("w52_lwpr")),
                     }
                 print(f"⚠️ 시세실패 [{stock_code}]: {data.get('msg1', '')}")
                 return None
@@ -489,7 +519,7 @@ class KISApi:
                                     break
                             except (ValueError, IndexError):
                                 pass
-                        total += int(item.get("cntg_vol", "0")) * int(item.get("stck_prpr", "0"))
+                        total += self._safe_int(item.get("cntg_vol")) * self._safe_int(item.get("stck_prpr"))
                     return total
                 print(f"⚠️ 분봉실패 [{stock_code}]: {data.get('msg1', '')}")
                 return 0
@@ -527,7 +557,7 @@ class KISApi:
                     items = data.get("output2", [])
                     dated = []
                     for item in items[:count]:
-                        close = int(item.get("stck_clpr", "0"))
+                        close = self._safe_int(item.get("stck_clpr"))
                         date_str = item.get("stck_bsop_date", "")
                         if close > 0 and date_str:
                             dated.append((date_str, close))
@@ -693,7 +723,10 @@ def _simhash(text, hashbits=64):
 
 
 def _hamming_distance(a, b):
+    """v8.0: Uses int.bit_count() on Python 3.10+, falls back to Kernighan's."""
     x = a ^ b
+    if hasattr(x, 'bit_count'):
+        return x.bit_count()
     count = 0
     while x:
         count += 1
@@ -764,13 +797,29 @@ class DuplicateDetector:
 
 
 class AlertCooldown:
-    __slots__ = ('cooldown', 'last_alert')
+    """v8.0: Added periodic cleanup to prevent unbounded memory growth."""
+    __slots__ = ('cooldown', 'last_alert', '_last_clean_time')
 
     def __init__(self, cooldown_minutes=30):
         self.cooldown = cooldown_minutes * 60
         self.last_alert = {}
+        self._last_clean_time = time.time()
+
+    def _clean_expired(self):
+        """v8.0: Remove entries older than 2x cooldown period."""
+        now = time.time()
+        if now - self._last_clean_time < 300:  # clean every 5 minutes
+            return
+        self._last_clean_time = now
+        max_age = self.cooldown * 2
+        old_count = len(self.last_alert)
+        self.last_alert = {k: t for k, t in self.last_alert.items() if now - t < max_age}
+        cleaned = old_count - len(self.last_alert)
+        if cleaned:
+            print(f"🧹 Cooldown cleanup: removed {cleaned} expired entries")
 
     def can_alert(self, stock_code):
+        self._clean_expired()  # v8.0: periodic cleanup
         now = time.time()
         if now - self.last_alert.get(stock_code, 0) >= self.cooldown:
             self.last_alert[stock_code] = now
@@ -781,28 +830,32 @@ class AlertCooldown:
         self.last_alert.pop(stock_code, None)
 
 async def safe_forward(client, channel, message, max_retries=3):
+    """v8.0: Returns False on final failure instead of raising."""
     for attempt in range(max_retries):
         try:
             await client.forward_messages(channel, message)
             return True
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
-        except Exception:
+        except Exception as e:
             if attempt >= max_retries - 1:
-                raise
+                print(f"⚠️ safe_forward failed after {max_retries} retries: {e}")
+                return False
     return False
 
 
 async def safe_send(client, channel, text, max_retries=3, **kwargs):
+    """v8.0: Returns False on final failure instead of raising."""
     for attempt in range(max_retries):
         try:
             await client.send_message(channel, text, **kwargs)
             return True
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
-        except Exception:
+        except Exception as e:
             if attempt >= max_retries - 1:
-                raise
+                print(f"⚠️ safe_send failed after {max_retries} retries: {e}")
+                return False
     return False
 
 # ============================================================
@@ -811,7 +864,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v7.9")
+    print(" Telegram Monitor v8.0")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
     print(" BOT3: 종목별 시세/거래대금/RISK/MA + OCR -> @alerts_forme")
@@ -910,9 +963,11 @@ async def main():
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
+        """v8.0: Properly schedule async disconnect instead of sync call."""
         print("🛑 Received shutdown signal...")
         shutdown_event.set()
-        client.disconnect()
+        # v8.0: Schedule the coroutine instead of calling synchronously
+        asyncio.ensure_future(client.disconnect())
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -970,28 +1025,25 @@ async def main():
                 else:
                     return
 
-            chat_name = getattr(chat, "title", "Unknown")
+            chat_name = getattr(chat, "title", None) or "Unknown"  # v8.0: handle None/empty
             msg = event.message.text or ""
             has_media = event.message.media is not None
 
             # ====== OCR (v7.9: runs regardless of KIS config) ======
             ocr_text = ""
             if has_media and OCR_AVAILABLE:
-                ocr_text = await extract_text_from_image(client, event.message)
+                ocr_text = await extract_text_from_image(client, event.message, chat_name=chat_name)
 
             combined_text = f"{msg}\n{ocr_text}".strip() if ocr_text else msg
 
             # ====== BOT 1: Unique messages (no crypto) ======
             if not msg and not ocr_text:
                 if has_media:
-                    try:
-                        await safe_forward(client, TARGET_CHANNEL, event.message)
-                    except Exception:
-                        try:
-                            icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
-                            await safe_send(client, TARGET_CHANNEL, f"📎 {icon}**{chat_name}** [미디어 메시지]", link_preview=False)
-                        except Exception:
-                            pass
+                    # v8.0: safe_forward/safe_send now return False instead of raising
+                    ok = await safe_forward(client, TARGET_CHANNEL, event.message)
+                    if not ok:
+                        icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
+                        await safe_send(client, TARGET_CHANNEL, f"📎 {icon}**{chat_name}** [미디어 메시지]", link_preview=False)
                 return
 
             if contains_crypto_keyword(combined_text):
@@ -1001,18 +1053,13 @@ async def main():
                 return
 
             print(f"📨 [{chat_name}] Unique msg ({len(combined_text)} chars)")
-            forwarded = False
-            try:
-                await safe_forward(client, TARGET_CHANNEL, event.message)
-                forwarded = True
+            # v8.0: safe_forward/safe_send return bool instead of raising
+            forwarded = await safe_forward(client, TARGET_CHANNEL, event.message)
+            if forwarded:
                 print(f"  ✅ Forwarded to {TARGET_CHANNEL}")
-            except Exception:
-                try:
-                    icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
-                    await safe_send(client, TARGET_CHANNEL, f"{icon}**{chat_name}**\n{combined_text[:500]}", link_preview=False)
-                    forwarded = True
-                except Exception:
-                    pass
+            else:
+                icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
+                forwarded = await safe_send(client, TARGET_CHANNEL, f"{icon}**{chat_name}**\n{combined_text[:500]}", link_preview=False)
             if not forwarded:
                 print(f"  ❌ FAILED to deliver to {TARGET_CHANNEL}!")
 
@@ -1020,22 +1067,20 @@ async def main():
             if EARNINGS_CHANNEL and combined_text and contains_earnings_keyword(combined_text):
                 matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
                 print(f"  📈 실적/공시: {matched}")
-                try:
-                    await safe_forward(client, EARNINGS_CHANNEL, event.message)
+                # v8.0: safe_forward/safe_send return bool
+                ok = await safe_forward(client, EARNINGS_CHANNEL, event.message)
+                if ok:
                     print(f"  ✅ -> {EARNINGS_CHANNEL}")
-                except Exception:
-                    try:
-                        await safe_send(
-                            client, EARNINGS_CHANNEL,
-                            f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
-                            link_preview=False,
-                        )
-                    except Exception:
-                        pass
+                else:
+                    await safe_send(
+                        client, EARNINGS_CHANNEL,
+                        f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
+                        link_preview=False,
+                    )
 
             # ====== BOT 3: 종목 알림 (v7.9: rate-limited API calls) ======
             if kis and combined_text:
-                codes = stock_universe.find_stocks_in_text(combined_text)
+                codes = set(stock_universe.find_stocks_in_text(combined_text))  # v8.0: deduplicate
                 text_codes = set(stock_universe.find_stocks_in_text(msg)) if msg else set()
 
                 for code in codes:
@@ -1068,13 +1113,31 @@ async def main():
                     from_ocr = ocr_text and code not in text_codes
                     source_tag = " [OCR]" if from_ocr else ""
                     mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
-                    print(
-                        f"  💰{source_tag} [{code}/{mkt_label}] {name} {price_info['price']:,}원 "
-                        f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억"
+
+                    # v8.0: Compute 52-week position for header highlight
+                    w52h = price_info.get("w52_hgpr", 0)
+                    w52l = price_info.get("w52_lwpr", 0)
+                    w52_pos_pct = (
+                        (price_info["price"] - w52l) / (w52h - w52l) * 100
+                        if w52h > w52l > 0 else 50
                     )
 
+                    print(
+                        f"  💰{source_tag} [{code}/{mkt_label}] {name} {price_info['price']:,}원 "
+                        f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억 "
+                        f"52주위치: {w52_pos_pct:.0f}%"
+                    )
+
+                    # v8.0: Header highlighting based on 52-week position
+                    if w52_pos_pct <= 30:
+                        header = f"🔻📉 **52주 저점 근접 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
+                    elif w52_pos_pct <= 50:
+                        header = f"⚠️📉 **52주 하단부 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
+                    else:
+                        header = f"🔔 **종목 알림 ({name})**"
+
                     alert_lines = [
-                        f"🔔 **종목 알림 ({name})**",
+                        header,
                         "",
                         f"📌 **{name}** ({code} | {mkt_label})",
                         f"💰 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
@@ -1091,14 +1154,9 @@ async def main():
                     if ma_detail:
                         alert_lines.append(f"  ➡ {ma_detail}")
 
-                    w52h = price_info.get("w52_hgpr", 0)
-                    w52l = price_info.get("w52_lwpr", 0)
+                    # v8.0: Use pre-computed w52h, w52l, w52_pos_pct from above
                     if w52h and w52l:
-                        pos_pct = (
-                            (price_info["price"] - w52l) / (w52h - w52l) * 100
-                            if w52h > w52l else 0
-                        )
-                        alert_lines.append(f"📍 52주: {w52l:,} ~ {w52h:,} (현재 {pos_pct:.0f}% 위치)")
+                        alert_lines.append(f"📍 52주: {w52l:,} ~ {w52h:,} (현재 {w52_pos_pct:.0f}% 위치)")
 
                     ocr_label = " 🔍(OCR)" if from_ocr else ""
                     alert_lines.extend([
@@ -1121,7 +1179,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"🎧 Listening... (v7.9)")
+    print(f"🎧 Listening... (v8.0)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:

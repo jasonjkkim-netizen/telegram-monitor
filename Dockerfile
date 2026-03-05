@@ -20,4 +20,8 @@ COPY . .
 RUN chown -R appuser:appuser /app
 USER appuser
 
+# v8.0: Health check - verify Python process is running
+HEALTHCHECK --interval=60s --timeout=10s --start-period=40s --retries=3 \
+  CMD pgrep -f "python bot.py" > /dev/null || exit 1
+
 CMD ["python", "bot.py"]
