@@ -695,7 +695,7 @@ def contains_earnings_keyword(text):
     lower = text.lower()
     has_anchor = any(kw in lower for kw in _ANCHOR_LOWER)
     has_data = any(kw in lower for kw in _DATA_LOWER)
-    if has_anchor and has_data:
+    if has_anchor or has_data:
         return True
     has_high_conf = any(kw in lower for kw in _HIGH_CONF_LOWER)
     if has_high_conf and FINANCIAL_NUMBER_PATTERN.search(text):
@@ -886,6 +886,7 @@ async def main():
 
     kis = KISApi() if kis_ok else None
     detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
+    earnings_detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
     cooldown = AlertCooldown(cooldown_minutes=30)
 
     # v7.9: retry master file download
@@ -1065,18 +1066,21 @@ async def main():
 
             # ====== BOT 2: 실적/공시 ======
             if EARNINGS_CHANNEL and combined_text and contains_earnings_keyword(combined_text):
-                matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
-                print(f"  📈 실적/공시: {matched}")
-                # v8.0: safe_forward/safe_send return bool
-                ok = await safe_forward(client, EARNINGS_CHANNEL, event.message)
-                if ok:
-                    print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                if await earnings_detector.is_duplicate(combined_text):
+                    print(f"  📈 실적/공시 duplicate, skipping")
                 else:
-                    await safe_send(
-                        client, EARNINGS_CHANNEL,
-                        f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
-                        link_preview=False,
-                    )
+                    matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
+                    print(f"  📈 실적/공시: {matched}")
+                    # v8.0: safe_forward/safe_send return bool
+                    ok = await safe_forward(client, EARNINGS_CHANNEL, event.message)
+                    if ok:
+                        print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                    else:
+                        await safe_send(
+                            client, EARNINGS_CHANNEL,
+                            f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
+                            link_preview=False,
+                        )
 
             # ====== BOT 3: 종목 알림 (v7.9: rate-limited API calls) ======
             if kis and combined_text:
