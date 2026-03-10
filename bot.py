@@ -1,9 +1,13 @@
 """
-Telegram Channel & Group Monitor v8.0
+Telegram Channel & Group Monitor v8.1
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v8.1 Changes:
+  [FEATURE] "WATCH" header highlight when all conditions met:
+            MA Bullish + 52주 below 60% + 거래대금 > 100억 + RISK Yellow/Green
 
 v8.0 Changes:
   [BUG FIX] Signal handler now properly schedules async disconnect (was sync call)
@@ -1128,8 +1132,21 @@ async def main():
                         f"52주위치: {w52_pos_pct:.0f}%"
                     )
 
+                    # v8.1: "Watch" header when all conditions met
+                    is_bullish_ma = ma_state.startswith("🟢")
+                    is_below_60pct = w52_pos_pct < 60
+                    is_volume_over_100b = price_info.get("acml_tr_pbmn", 0) > 10_000_000_000
+                    is_safe_risk = risk_emoji in ("🟡", "🟢")
+
+                    if is_bullish_ma and is_below_60pct and is_volume_over_100b and is_safe_risk:
+                        header = (
+                            f"👀🔥 **WATCH — {name}** "
+                            f"(MA강세 | 52주 {w52_pos_pct:.0f}% | "
+                            f"거래대금 {price_info.get('acml_tr_pbmn', 0)/100_000_000:.0f}억 | "
+                            f"RISK {risk_emoji})"
+                        )
                     # v8.0: Header highlighting based on 52-week position
-                    if w52_pos_pct <= 30:
+                    elif w52_pos_pct <= 30:
                         header = f"🔻📉 **52주 저점 근접 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
                     elif w52_pos_pct <= 50:
                         header = f"⚠️📉 **52주 하단부 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
