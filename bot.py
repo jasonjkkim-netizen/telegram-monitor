@@ -1,4 +1,4 @@
-"""
+h"""
 Telegram Channel & Group Monitor v8.0
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
@@ -7,7 +7,7 @@ BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 �
 
 v8.0 Changes:
   [BUG FIX] Signal handler now properly schedules async disconnect (was sync call)
-  [BUG FIX] KIS API int() conversions now validate data before parsing (crash prevention)
+  [BUG FIX] KIS API int() conversions now validate datha before parsing (crash prevention)
   [BUG FIX] safe_forward/safe_send return False on final retry instead of raising
   [BUG FIX] AlertCooldown now cleans old entries periodically (memory leak fix)
   [BUG FIX] find_stocks_in_text returns deduplicated set (was list with possible dupes)
@@ -84,7 +84,7 @@ SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 
 KIS_APP_KEY = os.environ.get("KIS_APP_KEY")
 KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET")
-VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "1000000000"))
+VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "5000000000"))
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 KIS_KOSPI_MST_URL = "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
@@ -695,7 +695,7 @@ def contains_earnings_keyword(text):
     lower = text.lower()
     has_anchor = any(kw in lower for kw in _ANCHOR_LOWER)
     has_data = any(kw in lower for kw in _DATA_LOWER)
-    if has_anchor and has_data:
+    if has_anchor or has_data:
         return True
     has_high_conf = any(kw in lower for kw in _HIGH_CONF_LOWER)
     if has_high_conf and FINANCIAL_NUMBER_PATTERN.search(text):
@@ -886,6 +886,7 @@ async def main():
 
     kis = KISApi() if kis_ok else None
     detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
+    earnings_detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
     cooldown = AlertCooldown(cooldown_minutes=30)
 
     # v7.9: retry master file download
@@ -1065,18 +1066,21 @@ async def main():
 
             # ====== BOT 2: 실적/공시 ======
             if EARNINGS_CHANNEL and combined_text and contains_earnings_keyword(combined_text):
-                matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
-                print(f"  📈 실적/공시: {matched}")
-                # v8.0: safe_forward/safe_send return bool
-                ok = await safe_forward(client, EARNINGS_CHANNEL, event.message)
-                if ok:
-                    print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                if await earnings_detector.is_duplicate(combined_text):
+                    print(f"  📈 실적/공시 duplicate, skipping")
                 else:
-                    await safe_send(
-                        client, EARNINGS_CHANNEL,
-                        f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
-                        link_preview=False,
-                    )
+                    matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
+                    print(f"  📈 실적/공시: {matched}")
+                    # v8.0: safe_forward/safe_send return bool
+                    ok = await safe_forward(client, EARNINGS_CHANNEL, event.message)
+                    if ok:
+                        print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                    else:
+                        await safe_send(
+                            client, EARNINGS_CHANNEL,
+                            f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
+                            link_preview=False,
+                        )
 
             # ====== BOT 3: 종목 알림 (v7.9: rate-limited API calls) ======
             if kis and combined_text:
@@ -1094,7 +1098,7 @@ async def main():
                         cooldown.reset(code)
                         continue
 
-                    if price_info.get("acml_tr_pbmn", 0) < 5_000_000_000:
+                    if price_info.get("acml_tr_pbmn", 0) < VOLUME_THRESHOLD:
                         cooldown.reset(code)
                         continue
 
