@@ -22,7 +22,7 @@ def contains_earnings_keyword(text):
     """Two-layer filter with high-confidence bypass.
 
     Returns True if:
-    - Both an anchor keyword AND a data keyword are present, OR
+    - Either an anchor keyword OR a data keyword is present, OR
     - A high-confidence keyword is present AND a financial number pattern is found.
     """
     if not text:
@@ -31,7 +31,7 @@ def contains_earnings_keyword(text):
 
     has_anchor = any(kw in lower for kw in ANCHOR_LOWER)
     has_data = any(kw in lower for kw in DATA_LOWER)
-    if has_anchor and has_data:
+    if has_anchor or has_data:
         return True
 
     has_high_conf = any(kw in lower for kw in HIGH_CONF_LOWER)
