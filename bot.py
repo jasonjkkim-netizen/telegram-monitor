@@ -8,6 +8,14 @@ BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 �
 v8.2 Changes:
   [BUG FIX] BOT 1: Whitespace-only msg (space/newline/tab) with media was silently
             dropped — msg.strip() now applied early so media-only branch handles it
+  [BUG FIX] BOT 1: Short crypto keywords (eth, ada, dot, pepe, etc.) were substring-
+            matching inside normal words (method, adapted, dotted) — legitimate
+            stock messages silently filtered. Now uses word-boundary regex for
+            short keywords, substring matching for long/Korean keywords.
+  [BUG FIX] OCR downloaded ALL media types (videos/audio/stickers) before failing
+            at Image.open() — now only processes photos and image documents.
+            Large video downloads were blocking the handler for minutes, causing
+            message backlog and perceived message loss.
   [BUG FIX] Version string mismatch (main printed v8.0, docstring said v8.1)
   [IMPROVE] BOT 1: Added logging for crypto-filtered and dedup-dropped messages
             (was silent — impossible to debug missing messages)
@@ -69,7 +77,7 @@ import aiohttp
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events, utils, errors
 from telethon.sessions import StringSession
-from telethon.types import Channel, Chat
+from telethon.types import Channel, Chat, MessageMediaPhoto, MessageMediaDocument
 
 # OCR imports (optional)
 try:
@@ -166,6 +174,14 @@ HIGH_CONFIDENCE_EARNINGS_KEYWORDS = frozenset([
 
 # Pre-compile lowercase sets for fast matching
 _CRYPTO_LOWER = frozenset(k.lower() for k in CRYPTO_KEYWORDS)
+# v8.2: Split short English keywords for word-boundary matching (prevent false positives)
+# Short keywords (≤4 chars, ASCII) like "eth" match inside "method" with substring search
+_CRYPTO_SHORT = frozenset(k for k in _CRYPTO_LOWER if len(k) <= 4 and k.isascii())
+_CRYPTO_LONG = _CRYPTO_LOWER - _CRYPTO_SHORT
+_CRYPTO_SHORT_PATTERN = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in sorted(_CRYPTO_SHORT, key=len, reverse=True)) + r')\b',
+    re.IGNORECASE | re.ASCII  # v8.2: ASCII mode so Korean chars = non-word boundary
+) if _CRYPTO_SHORT else None
 _ANCHOR_LOWER = frozenset(k.lower() for k in EARNINGS_ANCHOR_KEYWORDS)
 _DATA_LOWER = frozenset(k.lower() for k in EARNINGS_DATA_KEYWORDS)
 _HIGH_CONF_LOWER = frozenset(k.lower() for k in HIGH_CONFIDENCE_EARNINGS_KEYWORDS)
@@ -342,8 +358,18 @@ stock_universe = StockUniverse()
 # OCR
 # ============================================================
 async def extract_text_from_image(client, message, chat_name=""):
-    """v8.0: Added chat_name param for better error logging."""
+    """v8.0: Added chat_name param for better error logging.
+    v8.2: Only downloads photos and image documents (skip videos/audio/stickers)."""
     if not OCR_AVAILABLE or not message.media:
+        return ""
+    # v8.2: Only attempt OCR on photos and image-type documents
+    media = message.media
+    is_photo = isinstance(media, MessageMediaPhoto)
+    is_image_doc = False
+    if isinstance(media, MessageMediaDocument) and media.document:
+        mime = getattr(media.document, 'mime_type', '') or ''
+        is_image_doc = mime.startswith('image/')
+    if not is_photo and not is_image_doc:
         return ""
     try:
         image_bytes = await client.download_media(message, bytes)
@@ -696,10 +722,18 @@ def compute_ma_state(closes, current_price=None):
 # HELPER FUNCTIONS (v7.9: optimized keyword matching)
 # ============================================================
 def contains_crypto_keyword(text):
+    """v8.2: Short English keywords (eth, ada, dot, etc.) use word-boundary regex
+    to prevent false positives from words like 'method', 'adapted', 'dotted'."""
     if not text:
         return False
     lower = text.lower()
-    return any(kw in lower for kw in _CRYPTO_LOWER)
+    # Long keywords + Korean keywords: safe to use substring matching
+    if any(kw in lower for kw in _CRYPTO_LONG):
+        return True
+    # Short ASCII keywords: require word boundary (e.g. \beth\b won't match 'method')
+    if _CRYPTO_SHORT_PATTERN and _CRYPTO_SHORT_PATTERN.search(lower):
+        return True
+    return False
 
 
 def contains_earnings_keyword(text):
