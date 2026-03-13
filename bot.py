@@ -1,9 +1,19 @@
 """
-Telegram Channel & Group Monitor v8.1
+Telegram Channel & Group Monitor v8.2
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v8.2 Changes:
+  [BUG FIX] BOT 1: Whitespace-only msg (space/newline/tab) with media was silently
+            dropped — msg.strip() now applied early so media-only branch handles it
+  [BUG FIX] Version string mismatch (main printed v8.0, docstring said v8.1)
+  [IMPROVE] BOT 1: Added logging for crypto-filtered and dedup-dropped messages
+            (was silent — impossible to debug missing messages)
+  [IMPROVE] DuplicateDetector: Logs SimHash hamming distance on near-match hits
+            to help identify false positives
+  [IMPROVE] FloodWaitError handler now logs lost message preview before sleeping
 
 v8.1 Changes:
   [FEATURE] "WATCH" header highlight when all conditions met:
@@ -781,15 +791,19 @@ class DuplicateDetector:
                 return True
             self._clean_old()
             now = time.time()
-            text_hash = hashlib.md5(" ".join(text.lower().split()).encode()).hexdigest()
+            normalized = " ".join(text.lower().split())
+            text_hash = hashlib.md5(normalized.encode()).hexdigest()
             if text_hash in self.seen_hashes:
                 self.stats["duplicate"] += 1
                 return True
             if len(text.strip()) > 15:
                 text_simhash = _simhash(text)
                 for old_simhash, _ in self.seen_simhashes:
-                    if _hamming_distance(text_simhash, old_simhash) <= self.hamming_threshold:
+                    dist = _hamming_distance(text_simhash, old_simhash)
+                    if dist <= self.hamming_threshold:
                         self.stats["duplicate"] += 1
+                        # v8.2: log SimHash near-match distance for debugging false positives
+                        print(f"    🔎 SimHash match (hamming={dist}/{self.hamming_threshold}): {text[:60]}...")
                         return True
                 self.seen_simhashes.append((text_simhash, now))
             self.seen_hashes[text_hash] = now
@@ -868,7 +882,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v8.0")
+    print(" Telegram Monitor v8.2")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
     print(" BOT3: 종목별 시세/거래대금/RISK/MA + OCR -> @alerts_forme")
@@ -1030,7 +1044,7 @@ async def main():
                     return
 
             chat_name = getattr(chat, "title", None) or "Unknown"  # v8.0: handle None/empty
-            msg = event.message.text or ""
+            msg = (event.message.text or "").strip()  # v8.2: strip whitespace to prevent silent drops
             has_media = event.message.media is not None
 
             # ====== OCR (v7.9: runs regardless of KIS config) ======
@@ -1045,15 +1059,20 @@ async def main():
                 if has_media:
                     # v8.0: safe_forward/safe_send now return False instead of raising
                     ok = await safe_forward(client, TARGET_CHANNEL, event.message)
-                    if not ok:
+                    if ok:
+                        print(f"  📎 [{chat_name}] Media-only forwarded")
+                    else:
                         icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
                         await safe_send(client, TARGET_CHANNEL, f"📎 {icon}**{chat_name}** [미디어 메시지]", link_preview=False)
+                        print(f"  📎 [{chat_name}] Media-only sent as text fallback")
                 return
 
             if contains_crypto_keyword(combined_text):
+                print(f"  🚫 [{chat_name}] Crypto filtered ({len(combined_text)} chars): {combined_text[:80]}...")
                 return
 
             if await detector.is_duplicate(combined_text):
+                print(f"  ♻️ [{chat_name}] Duplicate ({len(combined_text)} chars): {combined_text[:80]}...")
                 return
 
             print(f"📨 [{chat_name}] Unique msg ({len(combined_text)} chars)")
@@ -1190,13 +1209,17 @@ async def main():
                     await asyncio.sleep(0.3)
 
         except errors.FloodWaitError as e:
+            # v8.2: Log the lost message context before sleeping
+            lost_ctx = getattr(event.message, 'text', '')
+            lost_preview = (lost_ctx or '')[:60]
+            print(f"  ⏳ FloodWait {e.seconds}s — message lost: {lost_preview}...")
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
             print(f"  ❌ Handler error: {e}")
             import traceback
             traceback.print_exc()
 
-    print(f"🎧 Listening... (v8.0)")
+    print(f"🎧 Listening... (v8.2)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
