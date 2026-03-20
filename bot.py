@@ -1338,20 +1338,30 @@ async def main():
             if not forwarded:
                 print(f"  ❌ FAILED to deliver to {TARGET_CHANNEL}!")
 
-            # ====== BOT 2: 실적/공시 ======
+            # ====== BOT 2: 실적/공시 (v8.3: background task to not block handler) ======
             if EARNINGS_CHANNEL and combined_text and contains_earnings_keyword(combined_text):
                 matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in combined_text.lower()][:5]
                 print(f"  📈 실적/공시: {matched}")
-                # v8.0: safe_forward/safe_send return bool
-                ok = await safe_forward(client, EARNINGS_CHANNEL, event.message)
-                if ok:
-                    print(f"  ✅ -> {EARNINGS_CHANNEL}")
-                else:
-                    await safe_send(
-                        client, EARNINGS_CHANNEL,
-                        f"📈 **[실적/공시]** {chat_name}\n🔑 {', '.join(matched)}\n{combined_text[:500]}",
-                        link_preview=False,
-                    )
+
+                async def _forward_earnings(msg_obj, ch_name, matched_kw, ctext):
+                    try:
+                        ok = await safe_forward(client, EARNINGS_CHANNEL, msg_obj)
+                        if ok:
+                            print(f"  ✅ -> {EARNINGS_CHANNEL}")
+                        else:
+                            await safe_send(
+                                client, EARNINGS_CHANNEL,
+                                f"📈 **[실적/공시]** {ch_name}\n🔑 {', '.join(matched_kw)}\n{ctext[:500]}",
+                                link_preview=False,
+                            )
+                    except Exception as e:
+                        print(f"  ❌ Earnings forward failed: {e}")
+
+                task = asyncio.create_task(
+                    _forward_earnings(event.message, chat_name, matched, combined_text)
+                )
+                _alert_tasks.add(task)
+                task.add_done_callback(_alert_tasks.discard)
 
             # ====== BOT 3: 종목 알림 (v8.3: runs as background task to not block BOT 1) ======
             if kis and combined_text:
