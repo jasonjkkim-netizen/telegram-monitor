@@ -291,10 +291,12 @@ class StockUniverse:
                             print(f"⚠️ Failed to download {market} master: HTTP {resp.status}")
                             continue
                         data = await resp.read()
+                    market_stock_count = 0
                     with zipfile.ZipFile(io.BytesIO(data)) as zf:
                         for filename in zf.namelist():
                             raw = zf.read(filename)
                             n2c, c2n, c2m = self._parse_master_file(raw, tail_len, market_code)
+                            market_stock_count += len(c2n)
                             for name, code in n2c.items():
                                 if name in all_name_to_code and all_name_to_code[name] != code:
                                     existing_code = all_name_to_code.pop(name)
@@ -307,7 +309,7 @@ class StockUniverse:
                                     all_name_to_code[name] = code
                             all_code_to_name.update(c2n)
                             all_code_to_market.update(c2m)
-                    print(f"✅ {market} master loaded: {len(c2n)} stocks")
+                    print(f"✅ {market} master loaded: {market_stock_count} stocks")
                 except Exception as e:
                     print(f"❌ Error loading {market} master: {e}")
             if all_name_to_code:
@@ -911,13 +913,15 @@ class DuplicateDetector:
 
 
 class AlertCooldown:
-    """v8.0: Added periodic cleanup to prevent unbounded memory growth."""
-    __slots__ = ('cooldown', 'last_alert', '_last_clean_time')
+    """v8.0: Added periodic cleanup to prevent unbounded memory growth.
+    v8.3: Added _lock to prevent race conditions in concurrent background tasks."""
+    __slots__ = ('cooldown', 'last_alert', '_last_clean_time', '_lock')
 
     def __init__(self, cooldown_minutes=30):
         self.cooldown = cooldown_minutes * 60
         self.last_alert = {}
         self._last_clean_time = time.time()
+        self._lock = asyncio.Lock()  # v8.3: thread-safe for concurrent background tasks
 
     def _clean_expired(self):
         """v8.0: Remove entries older than 2x cooldown period."""
@@ -937,6 +941,15 @@ class AlertCooldown:
         self._clean_expired()  # v8.0: periodic cleanup
         now = time.time()
         return now - self.last_alert.get(stock_code, 0) >= self.cooldown
+
+    async def try_claim(self, stock_code):
+        """v8.3: Atomically check AND reserve cooldown slot. Returns True if claimed.
+        Prevents duplicate alerts when multiple background tasks run concurrently."""
+        async with self._lock:
+            if not self.can_alert(stock_code):
+                return False
+            self.last_alert[stock_code] = time.time()
+            return True
 
     def mark_alerted(self, stock_code):
         """Record that an alert was successfully sent for this stock."""
@@ -986,16 +999,19 @@ async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_te
     Previously this ran inline in the handler, causing message loss during API calls."""
     try:
         for code in codes:
-            if not cooldown.can_alert(code):
+            # v8.3: try_claim atomically checks + reserves to prevent duplicate alerts
+            if not await cooldown.try_claim(code):
                 continue
 
             mkt = stock_universe.lookup_market(code)
 
             price_info = await kis.get_stock_price(code, market_code=mkt)
             if not price_info:
+                cooldown.reset(code)  # v8.3: release claim if API failed
                 continue
 
             if price_info.get("acml_tr_pbmn", 0) < VOLUME_THRESHOLD:
+                cooldown.reset(code)  # v8.3: release claim if volume too low
                 continue
 
             api_name = (price_info.get("name") or "").strip()
