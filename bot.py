@@ -1,9 +1,19 @@
 """
-Telegram Channel & Group Monitor v8.3
+Telegram Channel & Group Monitor v8.4
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
-BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균, 외국인/프로그램 매매 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+BOT 4: 외국인/프로그램 대량매매 트리거 알림 -> INVESTOR_ALERT_CHANNEL
+
+v8.4 Changes:
+  [FEATURE] BOT 3: 외국인 추정 순매수/순매도 + 프로그램 매매 데이터 추가
+            KIS API investor-trend-estimate (TR: HHPTJ04160200) 사용
+            KIS API program-trade-by-stock (TR: FHPPG04650101) 사용
+  [FEATURE] BOT 4: 외국인/프로그램 대량 매매 전용 알림 채널
+            장중 15분 간격으로 전체 종목 스캔, 외국인 순매수 50억+ 또는
+            프로그램 순매수 30억+ 감지 시 알림 발송
+  [FEATURE] KISApi에 get_investor_trend(), get_program_trade() 메서드 추가
 
 v8.3 Changes:
   [BUG FIX] BOT 1 message loss: BOT 3 stock alert processing now runs as background
@@ -123,11 +133,16 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL")
 EARNINGS_CHANNEL = os.environ.get("EARNINGS_CHANNEL")
 VOLUME_ALERT_CHANNEL = os.environ.get("VOLUME_ALERT_CHANNEL")
+INVESTOR_ALERT_CHANNEL = os.environ.get("INVESTOR_ALERT_CHANNEL")  # v8.4: BOT 4 외국인/프로그램 대량매매
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 
 KIS_APP_KEY = os.environ.get("KIS_APP_KEY")
 KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET")
 VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "1000000000"))
+# v8.4: BOT 4 thresholds (원 단위)
+FRGN_NET_THRESHOLD = int(os.environ.get("FRGN_NET_THRESHOLD", "5000000000"))   # 외국인 순매수 50억
+PRGM_NET_THRESHOLD = int(os.environ.get("PRGM_NET_THRESHOLD", "3000000000"))   # 프로그램 순매수 30억
+INVESTOR_SCAN_INTERVAL = int(os.environ.get("INVESTOR_SCAN_INTERVAL", "900"))  # 15분(초)
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))  # seconds, configurable
 
@@ -664,6 +679,104 @@ class KISApi:
                 print(f"❌ 일봉에러 [{stock_code}]: {e}")
                 return []
 
+    async def get_investor_trend(self, stock_code, market_code="J"):
+        """v8.4: 종목별 투자자별 추정 매매동향 (당일 장중 추정).
+        KIS API: investor-trend-estimate (TR: HHPTJ04160200)
+        Returns dict with foreign/institution net buy amounts, or None."""
+        token = await self.get_token()
+        if not token:
+            return None
+        params = {"MKSC_SHRN_ISCD": stock_code}
+        async with self._semaphore:
+            try:
+                async with await self._safe_request(
+                    "GET",
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/investor-trend-estimate",
+                    headers=self._headers("HHPTJ04160200"), params=params
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"⚠️ 투자자추정 HTTP {resp.status} [{stock_code}]")
+                        return None
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, ValueError) as e:
+                        print(f"⚠️ 투자자추정 JSON 파싱 실패 [{stock_code}]: {e}")
+                        return None
+                if data.get("rt_cd") == "0":
+                    output2 = data.get("output2", [])
+                    if not output2:
+                        return None
+                    # output2 is a list of investor-type rows; aggregate latest
+                    # Typical fields: frgn_ntby_qty (외국인 순매수 수량),
+                    #   frgn_ntby_tr_pbmn (외국인 순매수 거래대금),
+                    #   orgn_ntby_qty (기관 순매수 수량),
+                    #   orgn_ntby_tr_pbmn (기관 순매수 거래대금)
+                    # The first row is usually the latest/total
+                    row = output2[0] if isinstance(output2, list) else output2
+                    return {
+                        "frgn_ntby_qty": self._safe_int(row.get("frgn_ntby_qty")),
+                        "frgn_ntby_tr_pbmn": self._safe_int(row.get("frgn_ntby_tr_pbmn")),
+                        "orgn_ntby_qty": self._safe_int(row.get("orgn_ntby_qty")),
+                        "orgn_ntby_tr_pbmn": self._safe_int(row.get("orgn_ntby_tr_pbmn")),
+                    }
+                print(f"⚠️ 투자자추정 실패 [{stock_code}]: {data.get('msg1', '')}")
+                return None
+            except asyncio.TimeoutError:
+                print(f"⚠️ 투자자추정 타임아웃 [{stock_code}]")
+                return None
+            except Exception as e:
+                print(f"❌ 투자자추정 에러 [{stock_code}]: {e}")
+                return None
+
+    async def get_program_trade(self, stock_code, market_code="J"):
+        """v8.4: 종목별 프로그램 매매 현황 (당일).
+        KIS API: program-trade-by-stock (TR: FHPPG04650101)
+        Returns dict with program net buy amounts, or None."""
+        token = await self.get_token()
+        if not token:
+            return None
+        params = {
+            "FID_COND_MRKT_DIV_CODE": market_code,
+            "FID_INPUT_ISCD": stock_code,
+        }
+        async with self._semaphore:
+            try:
+                async with await self._safe_request(
+                    "GET",
+                    f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/program-trade-by-stock",
+                    headers=self._headers("FHPPG04650101"), params=params
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"⚠️ 프로그램매매 HTTP {resp.status} [{stock_code}]")
+                        return None
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, ValueError) as e:
+                        print(f"⚠️ 프로그램매매 JSON 파싱 실패 [{stock_code}]: {e}")
+                        return None
+                if data.get("rt_cd") == "0":
+                    output = data.get("output", [])
+                    if not output:
+                        return None
+                    # First row is latest; typical fields:
+                    #   ntby_qty (순매수수량), ntby_tr_pbmn (순매수거래대금)
+                    #   seln_qty (매도수량), shnu_qty (매수수량)
+                    row = output[0] if isinstance(output, list) else output
+                    return {
+                        "prgm_ntby_qty": self._safe_int(row.get("ntby_qty")),
+                        "prgm_ntby_tr_pbmn": self._safe_int(row.get("ntby_tr_pbmn")),
+                        "prgm_seln_qty": self._safe_int(row.get("seln_qty")),
+                        "prgm_shnu_qty": self._safe_int(row.get("shnu_qty")),
+                    }
+                print(f"⚠️ 프로그램매매 실패 [{stock_code}]: {data.get('msg1', '')}")
+                return None
+            except asyncio.TimeoutError:
+                print(f"⚠️ 프로그램매매 타임아웃 [{stock_code}]")
+                return None
+            except Exception as e:
+                print(f"❌ 프로그램매매 에러 [{stock_code}]: {e}")
+                return None
+
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
@@ -1023,6 +1136,10 @@ async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_te
             risk_label, risk_emoji = compute_risk_level(price_info)
             ma_state, ma_detail = compute_ma_state(daily_closes, price_info.get("price", 0))
 
+            # v8.4: Fetch foreigner + program trading data (non-blocking, allow failure)
+            investor_data = await kis.get_investor_trend(code, market_code=mkt)
+            program_data = await kis.get_program_trade(code, market_code=mkt)
+
             change_val = _safe_float(price_info.get("change_rate", "0"))
             direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
 
@@ -1082,6 +1199,27 @@ async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_te
             if ma_detail:
                 alert_lines.append(f"  ➡ {ma_detail}")
 
+            # v8.4: Foreigner + Program trading info
+            if investor_data or program_data:
+                alert_lines.append("")
+            if investor_data:
+                frgn_amt = investor_data.get("frgn_ntby_tr_pbmn", 0)
+                orgn_amt = investor_data.get("orgn_ntby_tr_pbmn", 0)
+                frgn_dir = "🔵순매수" if frgn_amt > 0 else ("🔴순매도" if frgn_amt < 0 else "—")
+                orgn_dir = "🔵순매수" if orgn_amt > 0 else ("🔴순매도" if orgn_amt < 0 else "—")
+                alert_lines.append(
+                    f"🌍 외국인: {frgn_dir} {abs(frgn_amt)/100_000_000:.1f}억"
+                )
+                alert_lines.append(
+                    f"🏦 기관: {orgn_dir} {abs(orgn_amt)/100_000_000:.1f}억"
+                )
+            if program_data:
+                prgm_amt = program_data.get("prgm_ntby_tr_pbmn", 0)
+                prgm_dir = "🔵순매수" if prgm_amt > 0 else ("🔴순매도" if prgm_amt < 0 else "—")
+                alert_lines.append(
+                    f"🖥️ 프로그램: {prgm_dir} {abs(prgm_amt)/100_000_000:.1f}억"
+                )
+
             if w52h and w52l:
                 alert_lines.append(f"📍 52주: {w52l:,} ~ {w52h:,} (현재 {w52_pos_pct:.0f}% 위치)")
 
@@ -1110,15 +1248,168 @@ async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_te
 
 
 # ============================================================
+# BOT 4: FOREIGNER/PROGRAM LARGE TRADE SCANNER (v8.4)
+# ============================================================
+class InvestorScanCooldown:
+    """v8.4: Cooldown for BOT 4 to avoid repeat alerts for same stock within scan cycle."""
+    __slots__ = ('cooldown', 'last_alert', '_lock')
+
+    def __init__(self, cooldown_minutes=60):
+        self.cooldown = cooldown_minutes * 60
+        self.last_alert = {}
+        self._lock = asyncio.Lock()
+
+    async def try_claim(self, key):
+        async with self._lock:
+            now = time.time()
+            if key in self.last_alert and (now - self.last_alert[key]) < self.cooldown:
+                return False
+            self.last_alert[key] = now
+            return True
+
+    def reset(self, key):
+        self.last_alert.pop(key, None)
+
+
+async def _investor_scan_loop(client, kis, shutdown_event):
+    """v8.4: Background task that periodically scans top-volume stocks
+    for large foreigner/program net buying/selling and sends alerts.
+    Runs every INVESTOR_SCAN_INTERVAL seconds during market hours (09:00~15:30 KST)."""
+    scan_cooldown = InvestorScanCooldown(cooldown_minutes=60)
+    print(f"🔄 BOT 4: Investor scan loop started (interval={INVESTOR_SCAN_INTERVAL}s)")
+
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.sleep(INVESTOR_SCAN_INTERVAL)
+
+            # Only scan during market hours (KST = UTC+9)
+            now = datetime.now()
+            hour_min = now.hour * 100 + now.minute
+            if hour_min < 910 or hour_min > 1535:
+                continue
+
+            # Scan top stocks from universe (pick ~50 major stocks by market cap proxy)
+            # We use the full stock universe but limit to avoid API overload
+            codes_to_scan = list(stock_universe.all_codes)[:100]
+            if not codes_to_scan:
+                continue
+
+            scan_count = 0
+            alert_count = 0
+            alerts_batch = []
+
+            for code in codes_to_scan:
+                if shutdown_event.is_set():
+                    break
+
+                mkt = stock_universe.lookup_market(code)
+                name = stock_universe.lookup_name(code) or code
+
+                # Fetch investor trend (foreigner + institution)
+                investor_data = await kis.get_investor_trend(code, market_code=mkt)
+                if not investor_data:
+                    await asyncio.sleep(0.2)
+                    continue
+
+                frgn_amt = investor_data.get("frgn_ntby_tr_pbmn", 0)
+                orgn_amt = investor_data.get("orgn_ntby_tr_pbmn", 0)
+
+                # Check foreigner threshold
+                frgn_trigger = abs(frgn_amt) >= FRGN_NET_THRESHOLD
+                # Check program threshold
+                program_data = None
+                prgm_trigger = False
+                if frgn_trigger:
+                    program_data = await kis.get_program_trade(code, market_code=mkt)
+
+                if not frgn_trigger:
+                    # Also check program even if foreigner didn't trigger
+                    program_data = await kis.get_program_trade(code, market_code=mkt)
+                    if program_data:
+                        prgm_amt = program_data.get("prgm_ntby_tr_pbmn", 0)
+                        prgm_trigger = abs(prgm_amt) >= PRGM_NET_THRESHOLD
+
+                if not frgn_trigger and not prgm_trigger:
+                    await asyncio.sleep(0.2)
+                    scan_count += 1
+                    continue
+
+                # Build unique cooldown key per trigger type
+                cooldown_key = f"{code}_frgn" if frgn_trigger else f"{code}_prgm"
+                if not await scan_cooldown.try_claim(cooldown_key):
+                    await asyncio.sleep(0.2)
+                    scan_count += 1
+                    continue
+
+                # Fetch price for context
+                price_info = await kis.get_stock_price(code, market_code=mkt)
+                mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
+                current_price = price_info.get("price", 0) if price_info else 0
+                change_val = _safe_float(price_info.get("change_rate", "0")) if price_info else 0
+                direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
+
+                # Build alert
+                lines = []
+                if frgn_trigger:
+                    frgn_dir = "🔵 순매수" if frgn_amt > 0 else "🔴 순매도"
+                    lines.append(f"🌍🔥 **외국인 대량매매 — {name}**")
+                    lines.append("")
+                    lines.append(f"📌 {name} ({code} | {mkt_label})")
+                    if current_price:
+                        lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
+                    lines.append(f"🌍 외국인: {frgn_dir} **{abs(frgn_amt)/100_000_000:.1f}억**")
+                    lines.append(f"🏦 기관: {'🔵' if orgn_amt > 0 else '🔴'} {abs(orgn_amt)/100_000_000:.1f}억")
+
+                if prgm_trigger and program_data:
+                    prgm_amt = program_data.get("prgm_ntby_tr_pbmn", 0)
+                    prgm_dir = "🔵 순매수" if prgm_amt > 0 else "🔴 순매도"
+                    if not frgn_trigger:
+                        lines.append(f"🖥️🔥 **프로그램 대량매매 — {name}**")
+                        lines.append("")
+                        lines.append(f"📌 {name} ({code} | {mkt_label})")
+                        if current_price:
+                            lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
+                    lines.append(f"🖥️ 프로그램: {prgm_dir} **{abs(prgm_amt)/100_000_000:.1f}억**")
+
+                lines.append(f"⏰ {now.strftime('%H:%M')}")
+                alerts_batch.append("\n".join(lines))
+                alert_count += 1
+                scan_count += 1
+                await asyncio.sleep(0.3)
+
+            # Send all alerts
+            for alert_text in alerts_batch:
+                await safe_send(client, INVESTOR_ALERT_CHANNEL, alert_text, link_preview=False)
+                await asyncio.sleep(0.5)
+
+            if scan_count > 0:
+                print(
+                    f"🔍 BOT 4: Scanned {scan_count} stocks, "
+                    f"{alert_count} alerts @ {datetime.now().strftime('%H:%M')}"
+                )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"❌ BOT 4 scan error: {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(60)  # wait before retry
+
+    print("🛑 BOT 4: Investor scan loop stopped")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v8.3")
+    print(" Telegram Monitor v8.4")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
-    print(" BOT3: 종목별 시세/거래대금/RISK/MA + OCR -> @alerts_forme")
+    print(" BOT3: 종목별 시세/거래대금/RISK/MA/외국인/프로그램 + OCR -> @alerts_forme")
+    print(" BOT4: 외국인/프로그램 대량매매 스캔 -> investor alert channel")
     print("=" * 50)
 
     if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL]):
@@ -1134,6 +1425,9 @@ async def main():
         print("⚠️ KIS API or VOLUME_ALERT_CHANNEL not set -- stock alerts disabled")
     if not EARNINGS_CHANNEL:
         print("⚠️ EARNINGS_CHANNEL not set -- earnings filter disabled")
+    bot4_ok = kis_ok and bool(INVESTOR_ALERT_CHANNEL)
+    if not bot4_ok:
+        print("⚠️ INVESTOR_ALERT_CHANNEL not set -- BOT 4 investor scan disabled")
 
     kis = KISApi() if kis_ok else None
     detector = DuplicateDetector(threshold=SIMILARITY_THRESHOLD)
@@ -1163,7 +1457,7 @@ async def main():
 
     monitored_ids = set()
     exclude_ids = set()
-    for ch in [TARGET_CHANNEL, EARNINGS_CHANNEL, VOLUME_ALERT_CHANNEL]:
+    for ch in [TARGET_CHANNEL, EARNINGS_CHANNEL, VOLUME_ALERT_CHANNEL, INVESTOR_ALERT_CHANNEL]:
         if not ch:
             continue
         try:
@@ -1206,7 +1500,9 @@ async def main():
     if EARNINGS_CHANNEL:
         print(f"📈 실적/공시 -> {EARNINGS_CHANNEL}")
     if kis:
-        print(f"🚨 종목 알림 (시세/거래대금/RISK/MA) -> {VOLUME_ALERT_CHANNEL}")
+        print(f"🚨 종목 알림 (시세/거래대금/RISK/MA/외국인/프로그램) -> {VOLUME_ALERT_CHANNEL}")
+    if bot4_ok and kis:
+        print(f"🌍 외국인/프로그램 대량매매 스캔 -> {INVESTOR_ALERT_CHANNEL}")
     if OCR_AVAILABLE:
         print("🔍 OCR enabled: image stock detection active")
 
@@ -1258,6 +1554,12 @@ async def main():
             pass
 
     bg_tasks.append(asyncio.create_task(periodic_refresh()))
+
+    # v8.4: BOT 4 investor scan background task
+    if bot4_ok and kis:
+        bg_tasks.append(asyncio.create_task(
+            _investor_scan_loop(client, kis, shutdown_event)
+        ))
 
     # --------------------------------------------------------
     @client.on(events.NewMessage())
@@ -1391,7 +1693,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"🎧 Listening... (v8.3)")
+    print(f"🎧 Listening... (v8.4)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
