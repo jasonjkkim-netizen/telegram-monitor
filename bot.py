@@ -6,6 +6,10 @@ BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
 
 v8.3 Changes:
+  [BUG FIX] BOT 1 message loss: BOT 3 stock alert processing now runs as background
+            task (asyncio.create_task) instead of blocking the message handler.
+            Previously, multiple KIS API calls (3 per stock × N stocks) blocked the
+            handler for seconds, causing Telegram to skip incoming messages.
   [BUG FIX] KeyError crash: price_info["price"] replaced with safe .get() access
   [BUG FIX] Cooldown logic: can_alert() no longer consumes cooldown prematurely;
             mark_alerted() only called after successful alert delivery
@@ -19,6 +23,8 @@ v8.3 Changes:
   [IMPROVE] OCR silent failure logging for photos that return empty text
   [IMPROVE] Stock detection logging shows which codes were found per message
   [IMPROVE] Configurable API_TIMEOUT env var (default 30s, was hardcoded)
+  [IMPROVE] Crypto filter now logs which keyword triggered (debug false positives)
+  [IMPROVE] get_peer_id failures now logged with chat name
 
 v8.2 Changes:
   [BUG FIX] BOT 1: Whitespace-only msg (space/newline/tab) with media was silently
@@ -969,6 +975,121 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
     return False
 
 # ============================================================
+# BOT 3: STOCK ALERT PROCESSING (v8.3: extracted as background task)
+# ============================================================
+async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_text, chat_name):
+    """v8.3: Process stock alerts in background to avoid blocking the message handler.
+    Previously this ran inline in the handler, causing message loss during API calls."""
+    try:
+        for code in codes:
+            if not cooldown.can_alert(code):
+                continue
+
+            mkt = stock_universe.lookup_market(code)
+
+            price_info = await kis.get_stock_price(code, market_code=mkt)
+            if not price_info:
+                continue
+
+            if price_info.get("acml_tr_pbmn", 0) < VOLUME_THRESHOLD:
+                continue
+
+            api_name = (price_info.get("name") or "").strip()
+            universe_name = stock_universe.lookup_name(code) or ""
+            name = universe_name or api_name or code
+
+            rolling_vol = await kis.get_rolling_volume(code, market_code=mkt, minutes=20)
+            daily_closes = await kis.get_daily_prices(code, market_code=mkt, count=60)
+            risk_label, risk_emoji = compute_risk_level(price_info)
+            ma_state, ma_detail = compute_ma_state(daily_closes, price_info.get("price", 0))
+
+            change_val = _safe_float(price_info.get("change_rate", "0"))
+            direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
+
+            from_ocr = ocr_text and code not in text_codes
+            source_tag = " [OCR]" if from_ocr else ""
+            mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
+
+            w52h = price_info.get("w52_hgpr", 0)
+            w52l = price_info.get("w52_lwpr", 0)
+            current_price = price_info.get("price", 0)
+            w52_pos_pct = (
+                (current_price - w52l) / (w52h - w52l) * 100
+                if w52h > w52l > 0 else 50
+            )
+
+            print(
+                f"  💰{source_tag} [{code}/{mkt_label}] {name} {current_price:,}원 "
+                f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억 "
+                f"52주위치: {w52_pos_pct:.0f}%"
+            )
+
+            # v8.1: "Watch" header when all conditions met
+            is_bullish_ma = ma_state.startswith("🟢")
+            is_below_60pct = w52_pos_pct < 60
+            is_volume_over_100b = price_info.get("acml_tr_pbmn", 0) > 10_000_000_000
+            is_safe_risk = risk_emoji in ("🟡", "🟢")
+
+            if is_bullish_ma and is_below_60pct and is_volume_over_100b and is_safe_risk:
+                header = (
+                    f"👀🔥 **WATCH — {name}** "
+                    f"(MA강세 | 52주 {w52_pos_pct:.0f}% | "
+                    f"거래대금 {price_info.get('acml_tr_pbmn', 0)/100_000_000:.0f}억 | "
+                    f"RISK {risk_emoji})"
+                )
+            elif w52_pos_pct <= 30:
+                header = f"🔻📉 **52주 저점 근접 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
+            elif w52_pos_pct <= 50:
+                header = f"⚠️📉 **52주 하단부 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
+            else:
+                header = f"🔔 **종목 알림 ({name})**"
+
+            alert_lines = [
+                header,
+                "",
+                f"📌 **{name}** ({code} | {mkt_label})",
+                f"💰 현재가: {current_price:,}원 {direction} {change_val:+.2f}%",
+                f"📈 시가: {price_info.get('open_price', 0):,} | "
+                f"고가: {price_info.get('high_price', 0):,} | "
+                f"저가: {price_info.get('low_price', 0):,}",
+                f"📊 거래량: {price_info.get('acml_vol', 0):,}주",
+                f"💵 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
+                f"💵 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
+                "",
+                f"⚠️ RISK: {risk_label}",
+                f"📉 이동평균: {ma_state}",
+            ]
+            if ma_detail:
+                alert_lines.append(f"  ➡ {ma_detail}")
+
+            if w52h and w52l:
+                alert_lines.append(f"📍 52주: {w52l:,} ~ {w52h:,} (현재 {w52_pos_pct:.0f}% 위치)")
+
+            ocr_label = " 🔍(OCR)" if from_ocr else ""
+            alert_lines.extend([
+                "",
+                f"💬 출처: {chat_name}{ocr_label}",
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}",
+            ])
+
+            try:
+                ok = await safe_send(client, VOLUME_ALERT_CHANNEL, "\n".join(alert_lines), link_preview=False)
+                if ok:
+                    cooldown.mark_alerted(code)
+                    print(f"  🚨 ALERT: {name} ({code}/{mkt_label}) ✅")
+                else:
+                    print(f"  ❌ Alert send failed: {name} ({code}/{mkt_label})")
+            except Exception as e:
+                print(f"  ❌ Alert failed: {e}")
+            await asyncio.sleep(0.3)
+
+    except Exception as e:
+        print(f"  ❌ Stock alert background task error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 async def main():
@@ -1124,7 +1245,8 @@ async def main():
             chat = await event.get_chat()
             try:
                 peer_id = utils.get_peer_id(chat)
-            except Exception:
+            except Exception as e:
+                print(f"  ⚠️ get_peer_id failed for {getattr(chat, 'title', '?')}: {e}")
                 return
             if peer_id in exclude_ids:
                 return
@@ -1162,7 +1284,14 @@ async def main():
                 return
 
             if contains_crypto_keyword(combined_text):
-                print(f"  🚫 [{chat_name}] Crypto filtered ({len(combined_text)} chars): {combined_text[:80]}...")
+                # v8.3: Log which keyword triggered, to debug false positives
+                lower = combined_text.lower()
+                triggered = [kw for kw in _CRYPTO_LONG if kw in lower]
+                if not triggered and _CRYPTO_SHORT_PATTERN:
+                    m = _CRYPTO_SHORT_PATTERN.search(lower)
+                    if m:
+                        triggered = [m.group()]
+                print(f"  🚫 [{chat_name}] Crypto filtered (keyword: {triggered[:3]}): {combined_text[:80]}...")
                 return
 
             if await detector.is_duplicate(combined_text):
@@ -1195,120 +1324,20 @@ async def main():
                         link_preview=False,
                     )
 
-            # ====== BOT 3: 종목 알림 (v7.9: rate-limited API calls) ======
+            # ====== BOT 3: 종목 알림 (v8.3: runs as background task to not block BOT 1) ======
             if kis and combined_text:
-                codes = set(stock_universe.find_stocks_in_text(combined_text))  # v8.0: deduplicate
+                codes = set(stock_universe.find_stocks_in_text(combined_text))
                 text_codes = set(stock_universe.find_stocks_in_text(msg)) if msg else set()
                 if codes:
                     code_names = [f"{c}({stock_universe.lookup_name(c) or '?'})" for c in codes]
                     print(f"  🔎 [{chat_name}] 종목 감지: {', '.join(code_names)}")
-
-                for code in codes:
-                    if not cooldown.can_alert(code):
-                        continue
-
-                    mkt = stock_universe.lookup_market(code)
-
-                    price_info = await kis.get_stock_price(code, market_code=mkt)
-                    if not price_info:
-                        cooldown.reset(code)
-                        continue
-
-                    if price_info.get("acml_tr_pbmn", 0) < VOLUME_THRESHOLD:
-                        cooldown.reset(code)
-                        continue
-
-                    api_name = (price_info.get("name") or "").strip()
-                    universe_name = stock_universe.lookup_name(code) or ""
-                    name = universe_name or api_name or code
-
-                    rolling_vol = await kis.get_rolling_volume(code, market_code=mkt, minutes=20)
-                    daily_closes = await kis.get_daily_prices(code, market_code=mkt, count=60)
-                    risk_label, risk_emoji = compute_risk_level(price_info)
-                    ma_state, ma_detail = compute_ma_state(daily_closes, price_info.get("price", 0))
-
-                    change_val = _safe_float(price_info.get("change_rate", "0"))
-                    direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
-
-                    from_ocr = ocr_text and code not in text_codes
-                    source_tag = " [OCR]" if from_ocr else ""
-                    mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
-
-                    # v8.0: Compute 52-week position for header highlight
-                    w52h = price_info.get("w52_hgpr", 0)
-                    w52l = price_info.get("w52_lwpr", 0)
-                    current_price = price_info.get("price", 0)
-                    w52_pos_pct = (
-                        (current_price - w52l) / (w52h - w52l) * 100
-                        if w52h > w52l > 0 else 50
-                    )
-
-                    print(
-                        f"  💰{source_tag} [{code}/{mkt_label}] {name} {current_price:,}원 "
-                        f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억 "
-                        f"52주위치: {w52_pos_pct:.0f}%"
-                    )
-
-                    # v8.1: "Watch" header when all conditions met
-                    is_bullish_ma = ma_state.startswith("🟢")
-                    is_below_60pct = w52_pos_pct < 60
-                    is_volume_over_100b = price_info.get("acml_tr_pbmn", 0) > 10_000_000_000
-                    is_safe_risk = risk_emoji in ("🟡", "🟢")
-
-                    if is_bullish_ma and is_below_60pct and is_volume_over_100b and is_safe_risk:
-                        header = (
-                            f"👀🔥 **WATCH — {name}** "
-                            f"(MA강세 | 52주 {w52_pos_pct:.0f}% | "
-                            f"거래대금 {price_info.get('acml_tr_pbmn', 0)/100_000_000:.0f}억 | "
-                            f"RISK {risk_emoji})"
+                    # v8.3: Process stock alerts in background so handler returns quickly
+                    asyncio.create_task(
+                        _process_stock_alerts(
+                            client, kis, cooldown, codes, text_codes,
+                            ocr_text, chat_name,
                         )
-                    # v8.0: Header highlighting based on 52-week position
-                    elif w52_pos_pct <= 30:
-                        header = f"🔻📉 **52주 저점 근접 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
-                    elif w52_pos_pct <= 50:
-                        header = f"⚠️📉 **52주 하단부 — {name}** (52주 {w52_pos_pct:.0f}% 위치)"
-                    else:
-                        header = f"🔔 **종목 알림 ({name})**"
-
-                    alert_lines = [
-                        header,
-                        "",
-                        f"📌 **{name}** ({code} | {mkt_label})",
-                        f"💰 현재가: {current_price:,}원 {direction} {change_val:+.2f}%",
-                        f"📈 시가: {price_info.get('open_price', 0):,} | "
-                        f"고가: {price_info.get('high_price', 0):,} | "
-                        f"저가: {price_info.get('low_price', 0):,}",
-                        f"📊 거래량: {price_info.get('acml_vol', 0):,}주",
-                        f"💵 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
-                        f"💵 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
-                        "",
-                        f"⚠️ RISK: {risk_label}",
-                        f"📉 이동평균: {ma_state}",
-                    ]
-                    if ma_detail:
-                        alert_lines.append(f"  ➡ {ma_detail}")
-
-                    # v8.0: Use pre-computed w52h, w52l, w52_pos_pct from above
-                    if w52h and w52l:
-                        alert_lines.append(f"📍 52주: {w52l:,} ~ {w52h:,} (현재 {w52_pos_pct:.0f}% 위치)")
-
-                    ocr_label = " 🔍(OCR)" if from_ocr else ""
-                    alert_lines.extend([
-                        "",
-                        f"💬 출처: {chat_name}{ocr_label}",
-                        f"⏰ {datetime.now().strftime('%H:%M:%S')}",
-                    ])
-
-                    try:
-                        ok = await safe_send(client, VOLUME_ALERT_CHANNEL, "\n".join(alert_lines), link_preview=False)
-                        if ok:
-                            cooldown.mark_alerted(code)
-                            print(f"  🚨 ALERT: {name} ({code}/{mkt_label}) ✅")
-                        else:
-                            print(f"  ❌ Alert send failed: {name} ({code}/{mkt_label})")
-                    except Exception as e:
-                        print(f"  ❌ Alert failed: {e}")
-                    await asyncio.sleep(0.3)
+                    )
 
         except errors.FloodWaitError as e:
             # v8.2: Log the lost message context before sleeping
