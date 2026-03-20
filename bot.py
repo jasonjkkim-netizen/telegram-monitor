@@ -1,9 +1,24 @@
 """
-Telegram Channel & Group Monitor v8.2
+Telegram Channel & Group Monitor v8.3
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균 상태 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
+
+v8.3 Changes:
+  [BUG FIX] KeyError crash: price_info["price"] replaced with safe .get() access
+  [BUG FIX] Cooldown logic: can_alert() no longer consumes cooldown prematurely;
+            mark_alerted() only called after successful alert delivery
+  [BUG FIX] Float conversion: change_rate "N/A" or non-numeric no longer crashes
+            (new _safe_float helper)
+  [BUG FIX] VOLUME_THRESHOLD env var now actually used (was hardcoded 5B)
+  [IMPROVE] HTTP status validation before JSON parsing in all KIS API methods
+  [IMPROVE] JSON parse errors caught specifically (ContentTypeError/ValueError)
+  [IMPROVE] Price validation: negative/zero prices return N/A in risk calculation,
+            52-week position clamped to 0-100%
+  [IMPROVE] OCR silent failure logging for photos that return empty text
+  [IMPROVE] Stock detection logging shows which codes were found per message
+  [IMPROVE] Configurable API_TIMEOUT env var (default 30s, was hardcoded)
 
 v8.2 Changes:
   [BUG FIX] BOT 1: Whitespace-only msg (space/newline/tab) with media was silently
@@ -108,6 +123,7 @@ KIS_APP_KEY = os.environ.get("KIS_APP_KEY")
 KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET")
 VOLUME_THRESHOLD = int(os.environ.get("VOLUME_THRESHOLD", "1000000000"))
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))  # seconds, configurable
 
 KIS_KOSPI_MST_URL = "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip"
 KIS_KOSDAQ_MST_URL = "https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip"
@@ -264,7 +280,7 @@ class StockUniverse:
                 (KIS_KOSDAQ_MST_URL, "KOSDAQ", "Q", _KOSDAQ_TAIL_LEN),
             ]:
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)) as resp:
                         if resp.status != 200:
                             print(f"⚠️ Failed to download {market} master: HTTP {resp.status}")
                             continue
@@ -405,7 +421,7 @@ class KISApi:
             except Exception:
                 pass
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=API_TIMEOUT)
         )
 
     async def ensure_session(self):
@@ -441,7 +457,14 @@ class KISApi:
         }
         try:
             async with await self._safe_request("POST", f"{KIS_BASE_URL}/oauth2/tokenP", json=body) as resp:
-                data = await resp.json()
+                if resp.status != 200:
+                    print(f"❌ KIS 토큰 HTTP {resp.status}")
+                    return None
+                try:
+                    data = await resp.json()
+                except (aiohttp.ContentTypeError, ValueError) as e:
+                    print(f"❌ KIS 토큰 JSON 파싱 실패: {e}")
+                    return None
             if "access_token" in data:
                 self.access_token = data["access_token"]
                 # v7.9: Use actual expiry from API response (fallback 85000s)
@@ -487,7 +510,14 @@ class KISApi:
                     f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price",
                     headers=self._headers("FHKST01010100"), params=params
                 ) as resp:
-                    data = await resp.json()
+                    if resp.status != 200:
+                        print(f"⚠️ 시세 HTTP {resp.status} [{stock_code}]")
+                        return None
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, ValueError) as e:
+                        print(f"⚠️ 시세 JSON 파싱 실패 [{stock_code}]: {e}")
+                        return None
                 if data.get("rt_cd") == "0":
                     out = data.get("output", {})
                     if not out:
@@ -542,7 +572,14 @@ class KISApi:
                     f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice",
                     headers=self._headers("FHKST03010200"), params=params
                 ) as resp:
-                    data = await resp.json()
+                    if resp.status != 200:
+                        print(f"⚠️ 분봉 HTTP {resp.status} [{stock_code}]")
+                        return 0
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, ValueError) as e:
+                        print(f"⚠️ 분봉 JSON 파싱 실패 [{stock_code}]: {e}")
+                        return 0
                 if data.get("rt_cd") == "0":
                     items = data.get("output2", [])
                     cutoff = now - timedelta(minutes=minutes)
@@ -592,7 +629,14 @@ class KISApi:
                     f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
                     headers=self._headers("FHKST03010100"), params=params
                 ) as resp:
-                    data = await resp.json()
+                    if resp.status != 200:
+                        print(f"⚠️ 일봉 HTTP {resp.status} [{stock_code}]")
+                        return []
+                    try:
+                        data = await resp.json()
+                    except (aiohttp.ContentTypeError, ValueError) as e:
+                        print(f"⚠️ 일봉 JSON 파싱 실패 [{stock_code}]: {e}")
+                        return []
                 if data.get("rt_cd") == "0":
                     items = data.get("output2", [])
                     dated = []
@@ -619,14 +663,26 @@ class KISApi:
 # ============================================================
 # RISK LEVEL & MOVING AVERAGE HELPERS
 # ============================================================
+def _safe_float(val, default=0.0):
+    """Safely convert API string to float without crashing."""
+    if val is None:
+        return default
+    try:
+        return float(str(val).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return default
+
+
 def compute_risk_level(price_info):
     try:
-        change_rate = abs(float(price_info.get("change_rate", "0")))
+        change_rate = abs(_safe_float(price_info.get("change_rate", "0")))
         price = price_info.get("price", 0)
+        if not isinstance(price, (int, float)) or price <= 0:
+            return "❓ N/A", "❓"
         w52_high = price_info.get("w52_hgpr", 0)
         w52_low = price_info.get("w52_lwpr", 0)
         position = (
-            (price - w52_low) / (w52_high - w52_low) * 100
+            max(0, min(100, (price - w52_low) / (w52_high - w52_low) * 100))
             if w52_high > w52_low > 0 else 50
         )
         risk_score = 0
@@ -871,12 +927,14 @@ class AlertCooldown:
             print(f"🧹 Cooldown cleanup: removed {cleaned} expired entries")
 
     def can_alert(self, stock_code):
+        """Check if enough time has passed since last alert. Does NOT set timestamp."""
         self._clean_expired()  # v8.0: periodic cleanup
         now = time.time()
-        if now - self.last_alert.get(stock_code, 0) >= self.cooldown:
-            self.last_alert[stock_code] = now
-            return True
-        return False
+        return now - self.last_alert.get(stock_code, 0) >= self.cooldown
+
+    def mark_alerted(self, stock_code):
+        """Record that an alert was successfully sent for this stock."""
+        self.last_alert[stock_code] = time.time()
 
     def reset(self, stock_code):
         self.last_alert.pop(stock_code, None)
@@ -916,7 +974,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v8.2")
+    print(" Telegram Monitor v8.3")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
     print(" BOT3: 종목별 시세/거래대금/RISK/MA + OCR -> @alerts_forme")
@@ -1085,6 +1143,8 @@ async def main():
             ocr_text = ""
             if has_media and OCR_AVAILABLE:
                 ocr_text = await extract_text_from_image(client, event.message, chat_name=chat_name)
+                if has_media and not ocr_text and isinstance(event.message.media, (MessageMediaPhoto,)):
+                    print(f"  🔍 [{chat_name}] OCR returned empty for photo (may have failed silently)")
 
             combined_text = f"{msg}\n{ocr_text}".strip() if ocr_text else msg
 
@@ -1139,6 +1199,9 @@ async def main():
             if kis and combined_text:
                 codes = set(stock_universe.find_stocks_in_text(combined_text))  # v8.0: deduplicate
                 text_codes = set(stock_universe.find_stocks_in_text(msg)) if msg else set()
+                if codes:
+                    code_names = [f"{c}({stock_universe.lookup_name(c) or '?'})" for c in codes]
+                    print(f"  🔎 [{chat_name}] 종목 감지: {', '.join(code_names)}")
 
                 for code in codes:
                     if not cooldown.can_alert(code):
@@ -1151,7 +1214,7 @@ async def main():
                         cooldown.reset(code)
                         continue
 
-                    if price_info.get("acml_tr_pbmn", 0) < 5_000_000_000:
+                    if price_info.get("acml_tr_pbmn", 0) < VOLUME_THRESHOLD:
                         cooldown.reset(code)
                         continue
 
@@ -1162,9 +1225,9 @@ async def main():
                     rolling_vol = await kis.get_rolling_volume(code, market_code=mkt, minutes=20)
                     daily_closes = await kis.get_daily_prices(code, market_code=mkt, count=60)
                     risk_label, risk_emoji = compute_risk_level(price_info)
-                    ma_state, ma_detail = compute_ma_state(daily_closes, price_info["price"])
+                    ma_state, ma_detail = compute_ma_state(daily_closes, price_info.get("price", 0))
 
-                    change_val = float(price_info.get("change_rate", "0"))
+                    change_val = _safe_float(price_info.get("change_rate", "0"))
                     direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
 
                     from_ocr = ocr_text and code not in text_codes
@@ -1174,13 +1237,14 @@ async def main():
                     # v8.0: Compute 52-week position for header highlight
                     w52h = price_info.get("w52_hgpr", 0)
                     w52l = price_info.get("w52_lwpr", 0)
+                    current_price = price_info.get("price", 0)
                     w52_pos_pct = (
-                        (price_info["price"] - w52l) / (w52h - w52l) * 100
+                        (current_price - w52l) / (w52h - w52l) * 100
                         if w52h > w52l > 0 else 50
                     )
 
                     print(
-                        f"  💰{source_tag} [{code}/{mkt_label}] {name} {price_info['price']:,}원 "
+                        f"  💰{source_tag} [{code}/{mkt_label}] {name} {current_price:,}원 "
                         f"({change_val:+.2f}%) 20분거래대금: {rolling_vol/100_000_000:.2f}억 "
                         f"52주위치: {w52_pos_pct:.0f}%"
                     )
@@ -1210,7 +1274,7 @@ async def main():
                         header,
                         "",
                         f"📌 **{name}** ({code} | {mkt_label})",
-                        f"💰 현재가: {price_info['price']:,}원 {direction} {change_val:+.2f}%",
+                        f"💰 현재가: {current_price:,}원 {direction} {change_val:+.2f}%",
                         f"📈 시가: {price_info.get('open_price', 0):,} | "
                         f"고가: {price_info.get('high_price', 0):,} | "
                         f"저가: {price_info.get('low_price', 0):,}",
@@ -1236,8 +1300,12 @@ async def main():
                     ])
 
                     try:
-                        await safe_send(client, VOLUME_ALERT_CHANNEL, "\n".join(alert_lines), link_preview=False)
-                        print(f"  🚨 ALERT: {name} ({code}/{mkt_label}) ✅")
+                        ok = await safe_send(client, VOLUME_ALERT_CHANNEL, "\n".join(alert_lines), link_preview=False)
+                        if ok:
+                            cooldown.mark_alerted(code)
+                            print(f"  🚨 ALERT: {name} ({code}/{mkt_label}) ✅")
+                        else:
+                            print(f"  ❌ Alert send failed: {name} ({code}/{mkt_label})")
                     except Exception as e:
                         print(f"  ❌ Alert failed: {e}")
                     await asyncio.sleep(0.3)
@@ -1253,7 +1321,7 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"🎧 Listening... (v8.2)")
+    print(f"🎧 Listening... (v8.3)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
