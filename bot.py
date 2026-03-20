@@ -946,7 +946,8 @@ class AlertCooldown:
         self.last_alert.pop(stock_code, None)
 
 async def safe_forward(client, channel, message, max_retries=3):
-    """v8.0: Returns False on final failure instead of raising."""
+    """v8.0: Returns False on final failure instead of raising.
+    v8.3: Added backoff delay between non-FloodWait retries."""
     for attempt in range(max_retries):
         try:
             await client.forward_messages(channel, message)
@@ -957,11 +958,13 @@ async def safe_forward(client, channel, message, max_retries=3):
             if attempt >= max_retries - 1:
                 print(f"⚠️ safe_forward failed after {max_retries} retries: {e}")
                 return False
+            await asyncio.sleep(1 * (attempt + 1))  # v8.3: backoff 1s, 2s
     return False
 
 
 async def safe_send(client, channel, text, max_retries=3, **kwargs):
-    """v8.0: Returns False on final failure instead of raising."""
+    """v8.0: Returns False on final failure instead of raising.
+    v8.3: Added backoff delay between non-FloodWait retries."""
     for attempt in range(max_retries):
         try:
             await client.send_message(channel, text, **kwargs)
@@ -972,6 +975,7 @@ async def safe_send(client, channel, text, max_retries=3, **kwargs):
             if attempt >= max_retries - 1:
                 print(f"⚠️ safe_send failed after {max_retries} retries: {e}")
                 return False
+            await asyncio.sleep(1 * (attempt + 1))  # v8.3: backoff 1s, 2s
     return False
 
 # ============================================================
@@ -1191,6 +1195,7 @@ async def main():
         print("🔍 OCR enabled: image stock detection active")
 
     bg_tasks = []
+    _alert_tasks = set()  # v8.3: prevent background tasks from being garbage-collected
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
@@ -1262,9 +1267,17 @@ async def main():
             has_media = event.message.media is not None
 
             # ====== OCR (v7.9: runs regardless of KIS config) ======
+            # v8.3: OCR with timeout to prevent handler blocking on large images
             ocr_text = ""
             if has_media and OCR_AVAILABLE:
-                ocr_text = await extract_text_from_image(client, event.message, chat_name=chat_name)
+                try:
+                    ocr_text = await asyncio.wait_for(
+                        extract_text_from_image(client, event.message, chat_name=chat_name),
+                        timeout=10.0  # v8.3: 10s max for OCR
+                    )
+                except asyncio.TimeoutError:
+                    print(f"  ⚠️ [{chat_name}] OCR timed out (>10s), skipping image text")
+                    ocr_text = ""
                 if has_media and not ocr_text and isinstance(event.message.media, (MessageMediaPhoto,)):
                     print(f"  🔍 [{chat_name}] OCR returned empty for photo (may have failed silently)")
 
@@ -1332,12 +1345,14 @@ async def main():
                     code_names = [f"{c}({stock_universe.lookup_name(c) or '?'})" for c in codes]
                     print(f"  🔎 [{chat_name}] 종목 감지: {', '.join(code_names)}")
                     # v8.3: Process stock alerts in background so handler returns quickly
-                    asyncio.create_task(
+                    task = asyncio.create_task(
                         _process_stock_alerts(
                             client, kis, cooldown, codes, text_codes,
                             ocr_text, chat_name,
                         )
                     )
+                    _alert_tasks.add(task)
+                    task.add_done_callback(_alert_tasks.discard)
 
         except errors.FloodWaitError as e:
             # v8.2: Log the lost message context before sleeping
