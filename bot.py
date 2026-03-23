@@ -13,7 +13,7 @@ cancel it because there were no await points during the sync call. Now runs
 in thread executor via loop.run_in_executor(), so the event loop stays
 responsive and the timeout actually works.
 [BUG FIX] Text fallback truncation: safe_send fallback was cutting messages at 500
-chars when forward failed. Telegram’s limit is 4096. Changed to 4000/3800
+chars when forward failed. Telegram limit is 4096. Changed to 4000/3800
 (leaving room for header prefix).
 [FEATURE] Edited message handler: added events.MessageEdited() handler that runs
 BOT 2 (earnings) and BOT 3 (stock alerts) on edited messages. Does NOT
@@ -445,7 +445,7 @@ stock_universe = StockUniverse()
 # ============================================================
 
 def _run_tesseract(image_bytes):
-“”“Synchronous OCR helper — runs in executor to avoid blocking event loop.
+“”“Synchronous OCR helper – runs in executor to avoid blocking event loop.
 v8.5: Extracted from async function so asyncio.wait_for timeout actually works.”””
 img = Image.open(io.BytesIO(image_bytes))
 return pytesseract.image_to_string(img, lang=“kor+eng”).strip()
@@ -1780,7 +1780,7 @@ async def handler(event):
         traceback.print_exc()
 
 # --------------------------------------------------------
-# v8.5: Edited message handler — catches BOT 2/3 keywords added via edits
+# v8.5: Edited message handler -- catches BOT 2/3 keywords added via edits
 # Does NOT re-forward to BOT 1 target (original already sent)
 # --------------------------------------------------------
 @client.on(events.MessageEdited())
@@ -1799,7 +1799,7 @@ async def edit_handler(event):
         if not msg:
             return
 
-        # BOT 2: 실적/공시 check on edited text
+        # BOT 2: check on edited text
         if EARNINGS_CHANNEL and contains_earnings_keyword(msg):
             matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in msg.lower()][:5]
             print(f"  ✏️📈 [{chat_name}] Edited msg matched earnings: {matched}")
@@ -1824,12 +1824,12 @@ async def edit_handler(event):
             _alert_tasks.add(task)
             task.add_done_callback(_alert_tasks.discard)
 
-        # BOT 3: 종목 알림 on edited text
+        # BOT 3: stock alerts on edited text
         if kis and msg:
             codes = set(stock_universe.find_stocks_in_text(msg))
             if codes:
                 code_names = [f"{c}({stock_universe.lookup_name(c) or '?'})" for c in codes]
-                print(f"  ✏️🔎 [{chat_name}] Edited msg 종목 감지: {', '.join(code_names)}")
+                print(f"  ✏️🔎 [{chat_name}] Edited msg stock detect: {', '.join(code_names)}")
                 task = asyncio.create_task(
                     _process_stock_alerts(
                         client, kis, cooldown, codes, codes,
