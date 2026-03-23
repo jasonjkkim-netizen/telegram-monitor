@@ -1,6 +1,9 @@
 """
-Comprehensive test suite for bot.py v8.3
-Tests all fixed functions without requiring API keys or Telegram connection.
+Comprehensive test suite for bot.py v8.4
+Tests all functions without requiring API keys or Telegram connection.
+
+Covers: v8.0-v8.3 core tests + v8.4 investor/program trading features.
+Run:  python test_bot.py
 """
 import asyncio
 import time
@@ -21,6 +24,8 @@ from bot import (
     DuplicateDetector, AlertCooldown, StockUniverse,
     VOLUME_THRESHOLD, _CRYPTO_LONG, _CRYPTO_SHORT_PATTERN,
     STOCK_CODE_PATTERN, _simhash, _hamming_distance,
+    InvestorScanCooldown, KISApi,
+    FRGN_NET_THRESHOLD, PRGM_NET_THRESHOLD, INVESTOR_SCAN_INTERVAL,
 )
 
 PASS = 0
@@ -161,6 +166,29 @@ def test_cooldown():
     # Reset should clear cooldown
     cd.reset("005930")
     assert_true(cd.can_alert("005930"), "After reset, alert allowed again")
+
+# ============================================================
+# TEST 5b: AlertCooldown try_claim (race condition prevention)
+# ============================================================
+@test("AlertCooldown try_claim (atomic claim)")
+def test_cooldown_try_claim():
+    async def _run():
+        cd = AlertCooldown(cooldown_minutes=30)
+
+        # First claim should succeed
+        assert_true(await cd.try_claim("005930"), "First try_claim succeeds")
+
+        # Second claim immediately should FAIL (already claimed)
+        assert_false(await cd.try_claim("005930"), "Second try_claim blocked")
+
+        # Different stock should succeed
+        assert_true(await cd.try_claim("000660"), "Different stock try_claim succeeds")
+
+        # After reset, can claim again
+        cd.reset("005930")
+        assert_true(await cd.try_claim("005930"), "After reset, try_claim succeeds again")
+
+    asyncio.run(_run())
 
 # ============================================================
 # TEST 6: compute_risk_level with edge cases
@@ -322,11 +350,86 @@ def test_integration():
     assert_false("get_daily_prices" in handler_section, "No daily price calls in handler")
 
 # ============================================================
+# TEST 11: v8.4 - InvestorScanCooldown
+# ============================================================
+@test("InvestorScanCooldown (v8.4)")
+def test_investor_scan_cooldown():
+    loop = asyncio.new_event_loop()
+    cd = InvestorScanCooldown(cooldown_minutes=1)  # 60s
+
+    # First claim should succeed
+    result = loop.run_until_complete(cd.try_claim("005930_frgn"))
+    assert_true(result, "First claim succeeds")
+
+    # Second claim same key should fail (within cooldown)
+    result = loop.run_until_complete(cd.try_claim("005930_frgn"))
+    assert_false(result, "Duplicate claim blocked")
+
+    # Different key should succeed
+    result = loop.run_until_complete(cd.try_claim("005930_prgm"))
+    assert_true(result, "Different key succeeds")
+
+    # Reset and re-claim should succeed
+    cd.reset("005930_frgn")
+    result = loop.run_until_complete(cd.try_claim("005930_frgn"))
+    assert_true(result, "Claim after reset succeeds")
+
+    loop.close()
+
+# ============================================================
+# TEST 12: v8.4 - KISApi has new methods
+# ============================================================
+@test("KISApi has investor/program methods (v8.4)")
+def test_kis_new_methods():
+    assert_true(hasattr(KISApi, 'get_investor_trend'), "KISApi has get_investor_trend")
+    assert_true(hasattr(KISApi, 'get_program_trade'), "KISApi has get_program_trade")
+    assert_true(callable(getattr(KISApi, 'get_investor_trend', None)), "get_investor_trend is callable")
+    assert_true(callable(getattr(KISApi, 'get_program_trade', None)), "get_program_trade is callable")
+
+# ============================================================
+# TEST 13: v8.4 - Env var defaults
+# ============================================================
+@test("v8.4 env var defaults")
+def test_v84_env_defaults():
+    assert_eq(FRGN_NET_THRESHOLD, 5_000_000_000, "FRGN_NET_THRESHOLD default 50억")
+    assert_eq(PRGM_NET_THRESHOLD, 3_000_000_000, "PRGM_NET_THRESHOLD default 30억")
+    assert_eq(INVESTOR_SCAN_INTERVAL, 900, "INVESTOR_SCAN_INTERVAL default 15분")
+
+# ============================================================
+# TEST 14: v8.4 - Source code verification
+# ============================================================
+@test("v8.4 source code structure")
+def test_v84_source():
+    with open(os.path.join(os.path.dirname(__file__), "bot.py"), "r") as f:
+        source = f.read()
+
+    # BOT 3 should include investor/program data fetch
+    process_section = source.split("async def _process_stock_alerts")[1].split("\nexcept")[0]
+    assert_true("get_investor_trend" in process_section, "BOT 3 fetches investor trend")
+    assert_true("get_program_trade" in process_section, "BOT 3 fetches program trade")
+    assert_true("외국인" in process_section, "BOT 3 alert includes 외국인 label")
+    assert_true("프로그램" in process_section, "BOT 3 alert includes 프로그램 label")
+
+    # BOT 4 background scanner should exist
+    assert_true("async def _investor_scan_loop" in source, "BOT 4 scan loop function exists")
+    assert_true("INVESTOR_ALERT_CHANNEL" in source, "INVESTOR_ALERT_CHANNEL env var used")
+    assert_true("_investor_scan_loop" in source, "BOT 4 loop referenced in main")
+
+    # API endpoints should be correct
+    assert_true("investor-trend-estimate" in source, "investor-trend-estimate endpoint")
+    assert_true("HHPTJ04160200" in source, "Correct TR ID for investor trend")
+    assert_true("program-trade-by-stock" in source, "program-trade-by-stock endpoint")
+    assert_true("FHPPG04650101" in source, "Correct TR ID for program trade")
+
+    # Version bump
+    assert_true("v8.4" in source, "Version bumped to v8.4")
+
+# ============================================================
 # RUN ALL TESTS
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print(" 🧪 Telegram Monitor v8.3 — Test Suite")
+    print(" 🧪 Telegram Monitor v8.4 — Test Suite")
     print("=" * 60)
     print()
 
