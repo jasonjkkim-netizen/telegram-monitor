@@ -1,10 +1,25 @@
 """
-Telegram Channel & Group Monitor v8.4
+Telegram Channel & Group Monitor v8.5
 ======================================
 BOT 1: All unique messages (no crypto/coin) -> TARGET_CHANNEL (@my_filtered_news)
 BOT 2: 실적/공시 keyword messages -> EARNINGS_CHANNEL (@jason_earnings)
 BOT 3: 종목 언급 시 -> 현재가, 거래대금, RISK, 이동평균, 외국인/프로그램 매매 알림 -> VOLUME_ALERT_CHANNEL (@alerts_forme)
 BOT 4: 외국인/프로그램 대량매매 트리거 알림 -> INVESTOR_ALERT_CHANNEL
+
+v8.5 Changes:
+  [BUG FIX] OCR was blocking event loop: pytesseract.image_to_string() is synchronous
+            and ran inline in the async handler. asyncio.wait_for(timeout=10) could NOT
+            cancel it because there were no await points during the sync call. Now runs
+            in thread executor via loop.run_in_executor(), so the event loop stays
+            responsive and the timeout actually works.
+  [BUG FIX] Text fallback truncation: safe_send fallback was cutting messages at 500
+            chars when forward failed. Telegram's limit is 4096. Changed to 4000/3800
+            (leaving room for header prefix).
+  [FEATURE] Edited message handler: added events.MessageEdited() handler that runs
+            BOT 2 (earnings) and BOT 3 (stock alerts) on edited messages. Does NOT
+            re-forward to BOT 1 target (original already sent).
+  [IMPROVE] Empty messages (no text, no media) now logged instead of silently dropped,
+            making it easier to debug message flow.
 
 v8.4 Changes:
   [FEATURE] BOT 3: 외국인 추정 순매수/순매도 + 프로그램 매매 데이터 추가
@@ -396,9 +411,17 @@ stock_universe = StockUniverse()
 # ============================================================
 # OCR
 # ============================================================
+def _run_tesseract(image_bytes):
+    """Synchronous OCR helper — runs in executor to avoid blocking event loop.
+    v8.5: Extracted from async function so asyncio.wait_for timeout actually works."""
+    img = Image.open(io.BytesIO(image_bytes))
+    return pytesseract.image_to_string(img, lang="kor+eng").strip()
+
+
 async def extract_text_from_image(client, message, chat_name=""):
     """v8.0: Added chat_name param for better error logging.
-    v8.2: Only downloads photos and image documents (skip videos/audio/stickers)."""
+    v8.2: Only downloads photos and image documents (skip videos/audio/stickers).
+    v8.5: Tesseract runs in thread executor so event loop stays responsive."""
     if not OCR_AVAILABLE or not message.media:
         return ""
     # v8.2: Only attempt OCR on photos and image-type documents
@@ -414,8 +437,10 @@ async def extract_text_from_image(client, message, chat_name=""):
         image_bytes = await client.download_media(message, bytes)
         if not image_bytes:
             return ""
-        img = Image.open(io.BytesIO(image_bytes))
-        text = pytesseract.image_to_string(img, lang="kor+eng").strip()
+        # v8.5: run_in_executor makes tesseract non-blocking AND lets
+        # asyncio.wait_for actually cancel it on timeout
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, _run_tesseract, image_bytes)
         if text:
             print(f"🔍 OCR extracted {len(text)} chars from image")
         return text
@@ -1405,7 +1430,7 @@ async def _investor_scan_loop(client, kis, shutdown_event):
 async def main():
     start_time = time.time()
     print("=" * 50)
-    print(" Telegram Monitor v8.4")
+    print(" Telegram Monitor v8.5")
     print(" BOT1: Filter+Dedup (no crypto) -> @my_filtered_news")
     print(" BOT2: 실적/공시 -> @jason_earnings")
     print(" BOT3: 종목별 시세/거래대금/RISK/MA/외국인/프로그램 + OCR -> @alerts_forme")
@@ -1612,6 +1637,9 @@ async def main():
                         icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
                         await safe_send(client, TARGET_CHANNEL, f"📎 {icon}**{chat_name}** [미디어 메시지]", link_preview=False)
                         print(f"  📎 [{chat_name}] Media-only sent as text fallback")
+                else:
+                    # v8.5: Log empty messages (service msgs, empty edits) for debugging
+                    print(f"  ⏭️ [{chat_name}] Empty message skipped (no text, no media)")
                 return
 
             if contains_crypto_keyword(combined_text):
@@ -1636,7 +1664,7 @@ async def main():
                 print(f"  ✅ Forwarded to {TARGET_CHANNEL}")
             else:
                 icon = "📺" if isinstance(chat, Channel) and chat.broadcast else "👥"
-                forwarded = await safe_send(client, TARGET_CHANNEL, f"{icon}**{chat_name}**\n{combined_text[:500]}", link_preview=False)
+                forwarded = await safe_send(client, TARGET_CHANNEL, f"{icon}**{chat_name}**\n{combined_text[:4000]}", link_preview=False)
             if not forwarded:
                 print(f"  ❌ FAILED to deliver to {TARGET_CHANNEL}!")
 
@@ -1653,7 +1681,7 @@ async def main():
                         else:
                             await safe_send(
                                 client, EARNINGS_CHANNEL,
-                                f"📈 **[실적/공시]** {ch_name}\n🔑 {', '.join(matched_kw)}\n{ctext[:500]}",
+                                f"📈 **[실적/공시]** {ch_name}\n🔑 {', '.join(matched_kw)}\n{ctext[:3800]}",
                                 link_preview=False,
                             )
                     except Exception as e:
@@ -1693,7 +1721,72 @@ async def main():
             import traceback
             traceback.print_exc()
 
-    print(f"🎧 Listening... (v8.4)")
+    # --------------------------------------------------------
+    # v8.5: Edited message handler — catches BOT 2/3 keywords added via edits
+    # Does NOT re-forward to BOT 1 target (original already sent)
+    # --------------------------------------------------------
+    @client.on(events.MessageEdited())
+    async def edit_handler(event):
+        try:
+            chat = await event.get_chat()
+            try:
+                peer_id = utils.get_peer_id(chat)
+            except Exception:
+                return
+            if peer_id in exclude_ids or peer_id not in monitored_ids:
+                return
+
+            chat_name = getattr(chat, "title", None) or "Unknown"
+            msg = (event.message.text or "").strip()
+            if not msg:
+                return
+
+            # BOT 2: 실적/공시 check on edited text
+            if EARNINGS_CHANNEL and contains_earnings_keyword(msg):
+                matched = [kw for kw in _ALL_EARNINGS_LOWER if kw in msg.lower()][:5]
+                print(f"  ✏️📈 [{chat_name}] Edited msg matched earnings: {matched}")
+
+                async def _forward_edit_earnings(msg_obj, ch_name, matched_kw, ctext):
+                    try:
+                        ok = await safe_forward(client, EARNINGS_CHANNEL, msg_obj)
+                        if ok:
+                            print(f"  ✅ Edited -> {EARNINGS_CHANNEL}")
+                        else:
+                            await safe_send(
+                                client, EARNINGS_CHANNEL,
+                                f"📈✏️ **[실적/공시 수정]** {ch_name}\n🔑 {', '.join(matched_kw)}\n{ctext[:3800]}",
+                                link_preview=False,
+                            )
+                    except Exception as e:
+                        print(f"  ❌ Edited earnings forward failed: {e}")
+
+                task = asyncio.create_task(
+                    _forward_edit_earnings(event.message, chat_name, matched, msg)
+                )
+                _alert_tasks.add(task)
+                task.add_done_callback(_alert_tasks.discard)
+
+            # BOT 3: 종목 알림 on edited text
+            if kis and msg:
+                codes = set(stock_universe.find_stocks_in_text(msg))
+                if codes:
+                    code_names = [f"{c}({stock_universe.lookup_name(c) or '?'})" for c in codes]
+                    print(f"  ✏️🔎 [{chat_name}] Edited msg 종목 감지: {', '.join(code_names)}")
+                    task = asyncio.create_task(
+                        _process_stock_alerts(
+                            client, kis, cooldown, codes, codes,
+                            "", chat_name,
+                        )
+                    )
+                    _alert_tasks.add(task)
+                    task.add_done_callback(_alert_tasks.discard)
+
+        except errors.FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            print(f"  ❌ Edit handler error: {e}")
+
+    print(f"🎧 Listening... (v8.5)")
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
@@ -1701,8 +1794,8 @@ async def main():
     finally:
         for task in bg_tasks:
             task.cancel()
-        await asyncio.gather(*bg_tasks, return_exceptions=True)
-        if kis:
+        await asyncio.gather(*bg_tasks, return_exceptions=True)        if kis:
+
             await kis.close()
         print("✅ Cleanup complete")
 
