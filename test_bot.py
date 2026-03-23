@@ -1,14 +1,15 @@
 """
-Comprehensive test suite for bot.py v8.4
+Comprehensive test suite for bot.py v8.5
 Tests all functions without requiring API keys or Telegram connection.
 
-Covers: v8.0-v8.3 core tests + v8.4 investor/program trading features.
+Covers: v8.0-v8.4 core tests + v8.5 OCR executor, truncation, edit handler fixes.
 Run:  python test_bot.py
 """
 import asyncio
 import time
 import sys
 import os
+import inspect
 
 # Set dummy env vars so module can import without crashing
 os.environ.setdefault("API_ID", "12345")
@@ -26,6 +27,7 @@ from bot import (
     STOCK_CODE_PATTERN, _simhash, _hamming_distance,
     InvestorScanCooldown, KISApi,
     FRGN_NET_THRESHOLD, PRGM_NET_THRESHOLD, INVESTOR_SCAN_INTERVAL,
+    _run_tesseract, extract_text_from_image,
 )
 
 PASS = 0
@@ -422,14 +424,90 @@ def test_v84_source():
     assert_true("FHPPG04650101" in source, "Correct TR ID for program trade")
 
     # Version bump
-    assert_true("v8.4" in source, "Version bumped to v8.4")
+    assert_true("v8.5" in source, "Version bumped to v8.5")
+
+# ============================================================
+# TEST 15: v8.5 - OCR runs in executor (non-blocking)
+# ============================================================
+@test("OCR runs in thread executor (v8.5)")
+def test_ocr_executor():
+    # _run_tesseract should be a plain sync function (not async)
+    assert_true(callable(_run_tesseract), "_run_tesseract exists and is callable")
+    assert_false(asyncio.iscoroutinefunction(_run_tesseract), "_run_tesseract is sync (not async)")
+
+    # extract_text_from_image should be async
+    assert_true(asyncio.iscoroutinefunction(extract_text_from_image), "extract_text_from_image is async")
+
+    # Source code should use run_in_executor
+    with open(os.path.join(os.path.dirname(__file__), "bot.py"), "r") as f:
+        source = f.read()
+    ocr_section = source.split("async def extract_text_from_image")[1].split("\nclass ")[0]
+    assert_true("run_in_executor" in ocr_section, "OCR uses run_in_executor")
+    assert_false("pytesseract.image_to_string" in ocr_section,
+                 "pytesseract.image_to_string NOT called directly in async function")
+
+    # _run_tesseract should contain the actual tesseract call
+    run_tess_source = inspect.getsource(_run_tesseract)
+    assert_true("image_to_string" in run_tess_source, "_run_tesseract calls image_to_string")
+
+# ============================================================
+# TEST 16: v8.5 - Text fallback uses 4000 chars, not 500
+# ============================================================
+@test("Text fallback truncation fixed (v8.5)")
+def test_truncation_fix():
+    with open(os.path.join(os.path.dirname(__file__), "bot.py"), "r") as f:
+        source = f.read()
+
+    handler_section = source.split("async def handler")[1].split("async def edit_handler")[0]
+
+    # BOT 1 fallback should use 4000, not 500
+    assert_true("combined_text[:4000]" in handler_section, "BOT 1 fallback uses [:4000]")
+    assert_false("combined_text[:500]" in handler_section, "BOT 1 fallback no longer uses [:500]")
+
+    # BOT 2 earnings fallback should use 3800, not 500
+    assert_true("ctext[:3800]" in handler_section, "BOT 2 fallback uses [:3800]")
+    assert_false("ctext[:500]" in handler_section, "BOT 2 fallback no longer uses [:500]")
+
+# ============================================================
+# TEST 17: v8.5 - Edited message handler exists
+# ============================================================
+@test("Edited message handler (v8.5)")
+def test_edit_handler():
+    with open(os.path.join(os.path.dirname(__file__), "bot.py"), "r") as f:
+        source = f.read()
+
+    # MessageEdited event should be registered
+    assert_true("events.MessageEdited()" in source, "MessageEdited event registered")
+    assert_true("async def edit_handler" in source, "edit_handler function exists")
+
+    # Edit handler should process BOT 2 (earnings) and BOT 3 (stock alerts)
+    edit_section = source.split("async def edit_handler")[1].split("\n    print(f\"🎧")[0]
+    assert_true("contains_earnings_keyword" in edit_section, "Edit handler checks earnings keywords")
+    assert_true("find_stocks_in_text" in edit_section, "Edit handler checks stock names")
+    assert_true("_process_stock_alerts" in edit_section, "Edit handler triggers stock alerts")
+
+    # Edit handler should NOT re-forward to BOT 1 target
+    assert_false("TARGET_CHANNEL" in edit_section, "Edit handler does NOT forward to BOT 1 target")
+
+# ============================================================
+# TEST 18: v8.5 - Empty message logging
+# ============================================================
+@test("Empty message logging (v8.5)")
+def test_empty_msg_logging():
+    with open(os.path.join(os.path.dirname(__file__), "bot.py"), "r") as f:
+        source = f.read()
+
+    handler_section = source.split("async def handler")[1].split("async def edit_handler")[0]
+
+    # The "no text, no media" branch should now have a log line
+    assert_true("Empty message skipped" in handler_section, "Empty messages are now logged")
 
 # ============================================================
 # RUN ALL TESTS
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print(" 🧪 Telegram Monitor v8.4 — Test Suite")
+    print(" 🧪 Telegram Monitor v8.5 — Test Suite")
     print("=" * 60)
     print()
 
