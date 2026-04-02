@@ -739,7 +739,8 @@ async def _with_retry(coro_fn, label="op", max_retries=3):
     """Generic retry wrapper with FloodWait + backoff handling."""
     for attempt in range(max_retries):
         try:
-            return await coro_fn()
+            await coro_fn()
+            return True
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
