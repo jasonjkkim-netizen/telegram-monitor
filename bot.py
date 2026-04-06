@@ -591,6 +591,8 @@ class KISApi:
                         "pbr": out.get("pbr", "N/A"),
                         "w52_hgpr": self._safe_int(out.get("w52_hgpr")),
                         "w52_lwpr": self._safe_int(out.get("w52_lwpr")),
+                        "mkt_cap": self._safe_int(out.get("hts_avls")),
+                        "lstn_stcn": self._safe_int(out.get("lstn_stcn")),
                     }
                 print(f"⚠️ 시세실패 [{stock_code}]: {data.get('msg1', '')}")
                 return None
@@ -1250,10 +1252,29 @@ async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_te
                 f"📊 거래량: {price_info.get('acml_vol', 0):,}주",
                 f"💵 누적거래대금: {price_info.get('acml_tr_pbmn', 0)/100_000_000:.1f}억",
                 f"💵 20분 거래대금: {rolling_vol/100_000_000:.1f}억",
+            ]
+            # v8.5: Market cap info
+            mkt_cap = price_info.get("mkt_cap", 0)
+            if mkt_cap > 0:
+                if mkt_cap >= 10000:
+                    alert_lines.append(f"🏢 시가총액: {mkt_cap/10000:.1f}조원")
+                else:
+                    alert_lines.append(f"🏢 시가총액: {mkt_cap:,}억원")
+            elif mkt_cap == 0:
+                lstn = price_info.get("lstn_stcn", 0)
+                if current_price > 0 and lstn > 0:
+                    calc_cap = current_price * lstn / 100_000_000
+                    if calc_cap >= 10000:
+                        alert_lines.append(f"🏢 시가총액: ~{calc_cap/10000:.1f}조원 (계산)")
+                    else:
+                        alert_lines.append(f"🏢 시가총액: ~{calc_cap:,.0f}억원 (계산)")
+                else:
+                    print(f"🔍 시총 [{code}] hts_avls=0, lstn_stcn={lstn}")
+            alert_lines.extend([
                 "",
                 f"⚠️ RISK: {risk_label}",
                 f"📉 이동평균: {ma_state}",
-            ]
+            ])
             if ma_detail:
                 alert_lines.append(f"  ➡ {ma_detail}")
 
@@ -1424,6 +1445,14 @@ async def _investor_scan_loop(client, kis, shutdown_event):
                         if current_price:
                             lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
                     lines.append(f"🖥️ 프로그램: {prgm_dir} **{abs(prgm_amt)/100_000_000:.1f}억**")
+
+                # v8.5: Market cap in BOT 4 alerts
+                if price_info:
+                    b4_cap = price_info.get("mkt_cap", 0)
+                    if b4_cap >= 10000:
+                        lines.append(f"🏢 시총: {b4_cap/10000:.1f}조")
+                    elif b4_cap > 0:
+                        lines.append(f"🏢 시총: {b4_cap:,}억")
 
                 lines.append(f"⏰ {now_kst.strftime('%H:%M')}")
                 alerts_batch.append("\n".join(lines))
