@@ -752,21 +752,14 @@ class KISApi:
                             print(f"🔍 투자자추정 [{stock_code}] empty response, keys={list(data.keys())}")
                             return None
                     row = output2[0] if isinstance(output2, list) else output2
-                    # v8.5: Debug logging to identify correct field names
-                    row_keys = list(row.keys()) if isinstance(row, dict) else []
-                    frgn_qty = self._safe_int(row.get("frgn_ntby_qty"))
-                    frgn_pbmn = self._safe_int(row.get("frgn_ntby_tr_pbmn"))
-                    if frgn_qty == 0 and frgn_pbmn == 0 and row_keys:
-                        print(f"🔍 투자자추정 [{stock_code}] all zeros - row keys: {row_keys[:15]}")
-                        print(f"🔍 투자자추정 [{stock_code}] row sample: {dict(list(row.items())[:8])}")
-                        print(f"🔍 투자자추정 [{stock_code}] total rows: {len(output2)}")
-                        if len(output2) > 1:
-                            print(f"🔍 투자자추정 [{stock_code}] row[1] sample: {dict(list(output2[1].items())[:8])}")
+                    # v8.5: Correct field names from KIS API
+                    frgn_qty = self._safe_int(row.get("frgn_fake_ntby_qty"))
+                    orgn_qty = self._safe_int(row.get("orgn_fake_ntby_qty"))
                     return {
                         "frgn_ntby_qty": frgn_qty,
-                        "frgn_ntby_tr_pbmn": frgn_pbmn,
-                        "orgn_ntby_qty": self._safe_int(row.get("orgn_ntby_qty")),
-                        "orgn_ntby_tr_pbmn": self._safe_int(row.get("orgn_ntby_tr_pbmn")),
+                        "frgn_ntby_tr_pbmn": 0,
+                        "orgn_ntby_qty": orgn_qty,
+                        "orgn_ntby_tr_pbmn": 0,
                     }
                 print(f"⚠️ 투자자추정 실패 [{stock_code}]: {data.get('msg1', '')}")
                 return None
@@ -815,18 +808,12 @@ class KISApi:
                             print(f"🔍 프로그램매매 [{stock_code}] empty response, keys={list(data.keys())}")
                             return None
                     row = output[0] if isinstance(output, list) else output
-                    # v8.5: Debug logging for field name verification
-                    prgm_qty = self._safe_int(row.get("ntby_qty"))
-                    prgm_pbmn = self._safe_int(row.get("ntby_tr_pbmn"))
-                    if prgm_qty == 0 and prgm_pbmn == 0 and isinstance(row, dict):
-                        row_keys = list(row.keys())
-                        print(f"🔍 프로그램매매 [{stock_code}] all zeros - row keys: {row_keys[:15]}")
-                        print(f"🔍 프로그램매매 [{stock_code}] row sample: {dict(list(row.items())[:8])}")
+                    # v8.5: Correct field names from KIS API (whol_smtn_ prefix)
                     return {
-                        "prgm_ntby_qty": prgm_qty,
-                        "prgm_ntby_tr_pbmn": prgm_pbmn,
-                        "prgm_seln_qty": self._safe_int(row.get("seln_qty")),
-                        "prgm_shnu_qty": self._safe_int(row.get("shnu_qty")),
+                        "prgm_ntby_qty": self._safe_int(row.get("whol_smtn_ntby_qty")),
+                        "prgm_ntby_tr_pbmn": self._safe_int(row.get("whol_smtn_ntby_tr_pbmn")),
+                        "prgm_seln_qty": self._safe_int(row.get("whol_smtn_seln_vol")),
+                        "prgm_shnu_qty": self._safe_int(row.get("whol_smtn_shnu_vol")),
                     }
                 print(f"⚠️ 프로그램매매 실패 [{stock_code}]: {data.get('msg1', '')}")
                 return None
@@ -1282,15 +1269,18 @@ async def _process_stock_alerts(client, kis, cooldown, codes, text_codes, ocr_te
             if investor_data or program_data:
                 alert_lines.append("")
             if investor_data:
-                frgn_amt = investor_data.get("frgn_ntby_tr_pbmn", 0)
-                orgn_amt = investor_data.get("orgn_ntby_tr_pbmn", 0)
-                frgn_dir = "🔵순매수" if frgn_amt > 0 else ("🔴순매도" if frgn_amt < 0 else "—")
-                orgn_dir = "🔵순매수" if orgn_amt > 0 else ("🔴순매도" if orgn_amt < 0 else "—")
+                frgn_qty = investor_data.get("frgn_ntby_qty", 0)
+                orgn_qty = investor_data.get("orgn_ntby_qty", 0)
+                # v8.5: API returns qty only, calculate amount = qty * price
+                frgn_amt = frgn_qty * current_price if current_price > 0 else 0
+                orgn_amt = orgn_qty * current_price if current_price > 0 else 0
+                frgn_dir = "🔵순매수" if frgn_qty > 0 else ("🔴순매도" if frgn_qty < 0 else "—")
+                orgn_dir = "🔵순매수" if orgn_qty > 0 else ("🔴순매도" if orgn_qty < 0 else "—")
                 alert_lines.append(
-                    f"🌍 외국인: {frgn_dir} {abs(frgn_amt)/100_000_000:.1f}억"
+                    f"🌍 외국인: {frgn_dir} {abs(frgn_qty):,}주 ({abs(frgn_amt)/100_000_000:.1f}억)"
                 )
                 alert_lines.append(
-                    f"🏦 기관: {orgn_dir} {abs(orgn_amt)/100_000_000:.1f}억"
+                    f"🏦 기관: {orgn_dir} {abs(orgn_qty):,}주 ({abs(orgn_amt)/100_000_000:.1f}억)"
                 )
             if program_data:
                 prgm_amt = program_data.get("prgm_ntby_tr_pbmn", 0)
@@ -1385,21 +1375,32 @@ async def _investor_scan_loop(client, kis, shutdown_event):
                 mkt = stock_universe.lookup_market(code)
                 name = stock_universe.lookup_name(code) or code
 
+                # v8.5: Fetch price first (needed to calculate foreigner amount from qty)
+                price_info = await kis.get_stock_price(code, market_code=mkt)
+                if not price_info or price_info.get("price", 0) <= 0:
+                    await asyncio.sleep(0.2)
+                    continue
+                current_price = price_info.get("price", 0)
+
                 # Fetch investor trend (foreigner + institution)
                 investor_data = await kis.get_investor_trend(code, market_code=mkt)
                 if not investor_data:
                     await asyncio.sleep(0.2)
                     continue
 
-                frgn_amt = investor_data.get("frgn_ntby_tr_pbmn", 0)
-                orgn_amt = investor_data.get("orgn_ntby_tr_pbmn", 0)
+                # v8.5: API returns qty only, calculate amount = qty * price
+                frgn_qty = investor_data.get("frgn_ntby_qty", 0)
+                orgn_qty = investor_data.get("orgn_ntby_qty", 0)
+                frgn_amt = frgn_qty * current_price
+                orgn_amt = orgn_qty * current_price
 
-                # Check foreigner threshold
+                # Check foreigner threshold (against calculated amount)
                 frgn_trigger = abs(frgn_amt) >= FRGN_NET_THRESHOLD
 
-                # v8.5: Always fetch and check program data (was skipped when frgn triggered)
+                # v8.5: Always fetch and check program data
                 program_data = await kis.get_program_trade(code, market_code=mkt)
                 prgm_trigger = False
+                prgm_amt = 0
                 if program_data:
                     prgm_amt = program_data.get("prgm_ntby_tr_pbmn", 0)
                     prgm_trigger = abs(prgm_amt) >= PRGM_NET_THRESHOLD
@@ -1416,34 +1417,29 @@ async def _investor_scan_loop(client, kis, shutdown_event):
                     scan_count += 1
                     continue
 
-                # Fetch price for context
-                price_info = await kis.get_stock_price(code, market_code=mkt)
                 mkt_label = "KOSDAQ" if mkt == "Q" else "KOSPI"
-                current_price = price_info.get("price", 0) if price_info else 0
-                change_val = _safe_float(price_info.get("change_rate", "0")) if price_info else 0
+                change_val = _safe_float(price_info.get("change_rate", "0"))
                 direction = "🔺" if change_val > 0 else ("🔻" if change_val < 0 else "▫")
 
                 # Build alert
                 lines = []
                 if frgn_trigger:
-                    frgn_dir = "🔵 순매수" if frgn_amt > 0 else "🔴 순매도"
-                    lines.append(f"🌍🔥 **외국인 대량매매 — {name}**")
+                    frgn_dir = "🔵 순매수" if frgn_qty > 0 else "🔴 순매도"
+                    lines.append(f"🌍🔥 **외국인 대량매매 -- {name}**")
                     lines.append("")
                     lines.append(f"📌 {name} ({code} | {mkt_label})")
-                    if current_price:
-                        lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
-                    lines.append(f"🌍 외국인: {frgn_dir} **{abs(frgn_amt)/100_000_000:.1f}억**")
-                    lines.append(f"🏦 기관: {'🔵' if orgn_amt > 0 else '🔴'} {abs(orgn_amt)/100_000_000:.1f}억")
+                    lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
+                    lines.append(f"🌍 외국인: {frgn_dir} **{abs(frgn_qty):,}주 ({abs(frgn_amt)/100_000_000:.1f}억)**")
+                    orgn_dir = "🔵" if orgn_qty > 0 else "🔴"
+                    lines.append(f"🏦 기관: {orgn_dir} {abs(orgn_qty):,}주 ({abs(orgn_amt)/100_000_000:.1f}억)")
 
                 if prgm_trigger and program_data:
-                    prgm_amt = program_data.get("prgm_ntby_tr_pbmn", 0)
                     prgm_dir = "🔵 순매수" if prgm_amt > 0 else "🔴 순매도"
                     if not frgn_trigger:
-                        lines.append(f"🖥️🔥 **프로그램 대량매매 — {name}**")
+                        lines.append(f"🖥️🔥 **프로그램 대량매매 -- {name}**")
                         lines.append("")
                         lines.append(f"📌 {name} ({code} | {mkt_label})")
-                        if current_price:
-                            lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
+                        lines.append(f"💰 {current_price:,}원 {direction} {change_val:+.2f}%")
                     lines.append(f"🖥️ 프로그램: {prgm_dir} **{abs(prgm_amt)/100_000_000:.1f}억**")
 
                 # v8.5: Market cap in BOT 4 alerts
