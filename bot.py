@@ -148,7 +148,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL")
 EARNINGS_CHANNEL = os.environ.get("EARNINGS_CHANNEL")
 VOLUME_ALERT_CHANNEL = os.environ.get("VOLUME_ALERT_CHANNEL")
-INVESTOR_ALERT_CHANNEL = os.environ.get("INVESTOR_ALERT_CHANNEL")  # v8.4: BOT 4 외국인/프로그램 대량매매
+INVESTOR_ALERT_CHANNEL = os.environ.get("INVESTOR_ALERT_CHANNEL", "@alerts_forme")  # v8.4: BOT 4 외국인/프로그램 대량매매
 SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.85"))
 
 KIS_APP_KEY = os.environ.get("KIS_APP_KEY")
